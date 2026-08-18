@@ -1,0 +1,25 @@
+{
+	"schemaVersion": 1,
+	"id": "minecraft-ai",
+	"version": "${version}",
+	"name": "Minecraft AI 建造助手",
+	"description": "通过本地AI(Ollama)对话生成建筑方案，预览确认后在游戏中生成",
+	"authors": [],
+	"license": "MIT",
+	"icon": "",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"com.mcai.MinecraftAIMod"
+		],
+		"client": [
+			"com.mcai.MinecraftAIClient"
+		]
+	},
+	"depends": {
+		"fabricloader": ">=0.19.0",
+		"minecraft": "~26.1.2",
+		"java": ">=24",
+		"fabric-api": "*"
+	}
+}
