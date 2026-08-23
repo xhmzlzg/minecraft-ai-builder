@@ -12,7 +12,7 @@ import net.minecraft.network.chat.Component;
 
 /**
  * AI 配置界面：切换后端（OpenAI 兼容 / 本地 Ollama）、修改 API 地址/模型/Key、思考模式开关。
- * 保存后立即生效（下次生成方案即用新配置）。
+ * 完整多语言支持（繁中 / 简中 / 英文）。
  */
 public class AiConfigScreen extends Screen {
 	private static final int PANEL_W = 380;
@@ -31,8 +31,12 @@ public class AiConfigScreen extends Screen {
 	private boolean thinkingEnabled;
 	private String status = "";
 
+	private static String tr(String key, Object... args) {
+		return Component.translatable(key, args).getString();
+	}
+
 	public AiConfigScreen(AiConfig config) {
-		super(Component.literal("AI 配置"));
+		super(Component.translatable("gui.minecraft-ai.config.title"));
 		this.config = config;
 		this.useOllama = !"openai".equals(config.provider);
 		this.thinkingEnabled = config.thinkingEnabled;
@@ -62,43 +66,43 @@ public class AiConfigScreen extends Screen {
 		addRenderableWidget(thinkingButton);
 
 		int fieldY = y0 + 52;
-		int labelW = 76;
+		int labelW = 86;
 		int fieldW = PANEL_W - 20 - labelW;
 		baseUrlField = new EditBox(this.font, x0 + 10 + labelW, fieldY, fieldW, 18, Component.literal("Base URL"));
 		baseUrlField.setValue(config.openaiBaseUrl);
 		baseUrlField.setMaxLength(10000);
-		baseUrlField.setHint(Component.literal("以 /v1 结尾，如 https://api.deepseek.com/v1"));
+		baseUrlField.setHint(Component.translatable("gui.minecraft-ai.hint.base_url"));
 		addRenderableWidget(baseUrlField);
 
-		modelField = new EditBox(this.font, x0 + 10 + labelW, fieldY + 20, fieldW, 18, Component.literal("模型名"));
+		modelField = new EditBox(this.font, x0 + 10 + labelW, fieldY + 20, fieldW, 18, Component.literal("Model"));
 		modelField.setValue(config.openaiModel);
 		modelField.setMaxLength(10000);
-		modelField.setHint(Component.literal("如 mimo-v2.5、deepseek-chat"));
+		modelField.setHint(Component.translatable("gui.minecraft-ai.hint.model"));
 		addRenderableWidget(modelField);
 
 		apiKeyField = new EditBox(this.font, x0 + 10 + labelW, fieldY + 40, fieldW, 18, Component.literal("API Key"));
 		apiKeyField.setValue(config.openaiApiKey);
 		apiKeyField.setMaxLength(10000);
-		apiKeyField.setHint(Component.literal("sk-xxx，仅保存在本地配置文件"));
+		apiKeyField.setHint(Component.translatable("gui.minecraft-ai.hint.api_key"));
 		addRenderableWidget(apiKeyField);
 
-		ollamaUrlField = new EditBox(this.font, x0 + 10 + labelW, fieldY + 60, fieldW, 18, Component.literal("Ollama 地址"));
+		ollamaUrlField = new EditBox(this.font, x0 + 10 + labelW, fieldY + 60, fieldW, 18, Component.literal("Ollama URL"));
 		ollamaUrlField.setValue(config.ollamaUrl);
 		ollamaUrlField.setMaxLength(10000);
-		ollamaUrlField.setHint(Component.literal("选择本地 Ollama 后端时使用"));
+		ollamaUrlField.setHint(Component.translatable("gui.minecraft-ai.hint.ollama_url"));
 		addRenderableWidget(ollamaUrlField);
 
-		ollamaModelField = new EditBox(this.font, x0 + 10 + labelW, fieldY + 80, fieldW, 18, Component.literal("Ollama 模型"));
+		ollamaModelField = new EditBox(this.font, x0 + 10 + labelW, fieldY + 80, fieldW, 18, Component.literal("Ollama Model"));
 		ollamaModelField.setValue(config.ollamaModel);
 		ollamaModelField.setMaxLength(10000);
-		ollamaModelField.setHint(Component.literal("选择本地 Ollama 后端时使用"));
+		ollamaModelField.setHint(Component.translatable("gui.minecraft-ai.hint.ollama_model"));
 		addRenderableWidget(ollamaModelField);
 
-		Button saveButton = Button.builder(Component.literal("保存"),
+		Button saveButton = Button.builder(Component.translatable("gui.minecraft-ai.btn.save"),
 				b -> saveConfig())
 				.bounds(x0 + 10, y0 + PANEL_H - 26, 80, 20)
 				.build();
-		Button backButton = Button.builder(Component.literal("返回"),
+		Button backButton = Button.builder(Component.translatable("gui.minecraft-ai.btn.back"),
 				b -> this.onClose())
 				.bounds(x0 + 100, y0 + PANEL_H - 26, 80, 20)
 				.build();
@@ -110,9 +114,10 @@ public class AiConfigScreen extends Screen {
 
 	private void refreshButtons() {
 		if (providerOaiButton != null) {
-			providerOaiButton.setMessage(Component.literal((useOllama ? "  " : "✓ ") + "OpenAI 兼容"));
-			providerOllamaButton.setMessage(Component.literal((useOllama ? "✓ " : "  ") + "本地 Ollama"));
-			thinkingButton.setMessage(Component.literal("思考模式：" + (thinkingEnabled ? "开" : "关")));
+			providerOaiButton.setMessage(Component.literal((useOllama ? "  " : "✓ ") + tr("gui.minecraft-ai.btn.openai")));
+			providerOllamaButton.setMessage(Component.literal((useOllama ? "✓ " : "  ") + tr("gui.minecraft-ai.btn.ollama")));
+			String stateStr = thinkingEnabled ? tr("gui.minecraft-ai.label.on") : tr("gui.minecraft-ai.label.off");
+			thinkingButton.setMessage(Component.literal(tr("gui.minecraft-ai.label.thinking", stateStr)));
 		}
 	}
 
@@ -125,14 +130,14 @@ public class AiConfigScreen extends Screen {
 		config.ollamaModel = ollamaModelField.getValue().trim();
 		config.thinkingEnabled = thinkingEnabled;
 		if (config.openaiModel.isEmpty()) {
-			status = "模型名不能为空，未保存";
+			status = tr("gui.minecraft-ai.status.model_empty");
 			return;
 		}
 		config.save(FabricLoader.getInstance().getConfigDir());
 		MinecraftAIClient.CONFIG = config;
 		MinecraftAIMod.LOGGER.info("[Minecraft AI] 配置已保存: provider={} model={} thinking={}",
 				config.provider, config.modelName(), config.thinkingEnabled);
-		status = "已保存并生效（下次生成方案即用新配置）";
+		status = tr("gui.minecraft-ai.status.config_saved");
 	}
 
 	@Override
@@ -148,16 +153,20 @@ public class AiConfigScreen extends Screen {
 
 		super.extractRenderState(context, mouseX, mouseY, delta);
 
-		context.centeredText(this.font, "AI 配置", cx, y0 + 4, 0xFFFFFFFF);
+		context.centeredText(this.font, tr("gui.minecraft-ai.config.title"), cx, y0 + 4, 0xFFFFFFFF);
 		int fieldY = y0 + 52;
-		context.text(this.font, "Base URL：", x0 + 12, fieldY + 3, 0xFFC0C0C0);
-		context.text(this.font, "模型名：", x0 + 12, fieldY + 23, 0xFFC0C0C0);
-		context.text(this.font, "API Key：", x0 + 12, fieldY + 43, 0xFFC0C0C0);
-		context.text(this.font, "Ollama 地址：", x0 + 12, fieldY + 63, 0xFFC0C0C0);
-		context.text(this.font, "Ollama 模型：", x0 + 12, fieldY + 83, 0xFFC0C0C0);
-		String info = "当前生效：" + (useOllama ? config.ollamaModel : config.openaiModel)
-				+ "（思考" + (thinkingEnabled ? "开" : "关") + "）";
+		context.text(this.font, tr("gui.minecraft-ai.label.base_url"), x0 + 12, fieldY + 3, 0xFFC0C0C0);
+		context.text(this.font, tr("gui.minecraft-ai.label.model_name"), x0 + 12, fieldY + 23, 0xFFC0C0C0);
+		context.text(this.font, tr("gui.minecraft-ai.label.api_key"), x0 + 12, fieldY + 43, 0xFFC0C0C0);
+		context.text(this.font, tr("gui.minecraft-ai.label.ollama_url"), x0 + 12, fieldY + 63, 0xFFC0C0C0);
+		context.text(this.font, tr("gui.minecraft-ai.label.ollama_model"), x0 + 12, fieldY + 83, 0xFFC0C0C0);
+
+		String stateStr = thinkingEnabled ? tr("gui.minecraft-ai.label.on") : tr("gui.minecraft-ai.label.off");
+		String activeModel = useOllama ? config.ollamaModel : config.openaiModel;
+		String info = tr("gui.minecraft-ai.label.current_active", activeModel, stateStr);
 		context.text(this.font, info, x0 + 12, y0 + 156, 0xFFC0C0C0);
-		context.text(this.font, status, x0 + 12, y0 + 166, status.isEmpty() ? 0xFFC0C0C0 : 0xFF66FF66);
+		if (!status.isEmpty()) {
+			context.text(this.font, status, x0 + 12, y0 + 176, status.contains("❌") || status.contains("未保存") ? 0xFFFF5555 : 0xFF66FF66);
+		}
 	}
 }

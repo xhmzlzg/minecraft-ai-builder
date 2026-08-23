@@ -2,8 +2,10 @@ package com.mcai.client.render;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import com.mcai.common.BuildingPlan;
 
@@ -11,7 +13,8 @@ import net.minecraft.client.gui.GuiGraphicsExtractor;
 
 /**
  * 等轴测 3D 方块预览渲染器。
- * 通过 fill() 扫描线填充多边形实现，不依赖 Minecraft 的方块渲染管线，跨版本稳定。
+ * 具备遮挡剔除（Occlusion Culling）、精准画家算法（Depth Sorting）与自适应缩放居中。
+ * 跨版本稳定高清渲染，无噪点、无乱码穿透。
  */
 public class PlanPreviewWidget {
 	private static final Map<String, Integer> BLOCK_COLORS = new HashMap<>();
@@ -54,7 +57,7 @@ public class PlanPreviewWidget {
 		BLOCK_COLORS.put("oak_fence_gate", 0xFF8D6E63);
 	}
 
-	private static final double TILE_W = 14.0;
+	private static final double BASE_TILE_W = 14.0;
 	private BuildingPlan plan;
 	private int centerX;
 	private int centerY;
@@ -64,6 +67,9 @@ public class PlanPreviewWidget {
 	private int clipRight;
 	private int clipTop;
 	private int clipBottom;
+
+	private int rotationIndex = 0; // 0: 0°, 1: 90°, 2: 180°, 3: 270°
+	private double zoomMultiplier = 1.0;
 
 	public void setPlan(BuildingPlan plan) {
 		this.plan = plan;
@@ -84,79 +90,192 @@ public class PlanPreviewWidget {
 		return plan != null;
 	}
 
+	public void rotateCW() {
+		rotationIndex = (rotationIndex + 1) % 4;
+	}
+
+	public void rotateCCW() {
+		rotationIndex = (rotationIndex + 3) % 4;
+	}
+
+	public void zoomIn() {
+		zoomMultiplier = Math.min(2.5, zoomMultiplier * 1.25);
+	}
+
+	public void zoomOut() {
+		zoomMultiplier = Math.max(0.4, zoomMultiplier / 1.25);
+	}
+
+	public void resetView() {
+		rotationIndex = 0;
+		zoomMultiplier = 1.0;
+	}
+
+	public int getRotationDegrees() {
+		return rotationIndex * 90;
+	}
+
 	public void render(GuiGraphicsExtractor context) {
 		if (plan == null || plan.size() == 0) {
 			return;
 		}
 
-		int w = plan.width;
-		int h = plan.height;
-		int d = plan.depth;
-
-		// 计算缩放：保证建筑整体放进视口
-		double tw = TILE_W;
-		double projectedW = (w + d) * tw / 2.0;
-		double projectedH = (w + d) * tw / 4.0 + (h + 1) * tw * 0.8;
-		double scale = Math.min(1.0, Math.min(viewWidth / projectedW, viewHeight / projectedH));
-		tw = Math.max(1.0, tw * scale);
-
-		int cx = centerX;
-		int cy = centerY;
-
-		// 画家算法：先画远（x+z 大），再画近；同列先画低层
-		List<BuildingPlan.Entry> sorted = new ArrayList<>(plan.entries);
-		sorted.sort((a, b) -> {
-			int farA = a.x() + a.z();
-			int farB = b.x() + b.z();
-			if (farA != farB) {
-				return Integer.compare(farB, farA);
-			}
-			return Integer.compare(a.y(), b.y());
-		});
-
-		// 方块过多时均匀抽稀，保证预览流畅（大建筑细节靠轮廓保留）
-		int total = sorted.size();
-		int maxRender = 12000;
-		int stride = total <= maxRender ? 1 : (int) Math.ceil((double) total / maxRender);
-		for (int i = 0; i < total; i += stride) {
-			BuildingPlan.Entry e = sorted.get(i);
-			renderBlock(context, cx, cy, tw, e.x(), e.y(), e.z(), colorOf(e.blockId()));
+		// 1. 收集建筑真实外接包围盒与实体方块集合
+		int minX = Integer.MAX_VALUE, maxX = Integer.MIN_VALUE;
+		int minY = Integer.MAX_VALUE, maxY = Integer.MIN_VALUE;
+		int minZ = Integer.MAX_VALUE, maxZ = Integer.MIN_VALUE;
+		Set<Long> solid = new HashSet<>(plan.entries.size() * 2);
+		for (BuildingPlan.Entry e : plan.entries) {
+			minX = Math.min(minX, e.x());
+			maxX = Math.max(maxX, e.x());
+			minY = Math.min(minY, e.y());
+			maxY = Math.max(maxY, e.y());
+			minZ = Math.min(minZ, e.z());
+			maxZ = Math.max(maxZ, e.z());
+			solid.add(posKey(e.x(), e.y(), e.z()));
 		}
-	}
 
-	private void renderBlock(GuiGraphicsExtractor context, int cx, int cy, double tw, int x, int y, int z, int baseColor) {
+		int spanX = Math.max(1, maxX - minX + 1);
+		int spanY = Math.max(1, maxY - minY + 1);
+		int spanZ = Math.max(1, maxZ - minZ + 1);
+
+		// 2. 自适应缩放：留出适当边距
+		double availW = Math.max(20, viewWidth - 16);
+		double availH = Math.max(20, viewHeight - 12);
+
+		double tw = BASE_TILE_W;
+		double projectedW = (spanX + spanZ) * tw / 2.0;
+		double projectedH = (spanX + spanZ) * tw / 4.0 + spanY * tw * 0.8;
+		double scale = Math.min(1.0, Math.min(availW / projectedW, availH / projectedH)) * zoomMultiplier;
+		tw = Math.max(1.0, tw * scale);
 		double th = tw / 2.0;
 		double bh = tw * 0.8;
 
-		// 顶面（亮）
-		int[][] top = new int[][] {
-			p(cx, cy, tw, th, bh, x, z, y + 1),
-			p(cx, cy, tw, th, bh, x + 1, z, y + 1),
-			p(cx, cy, tw, th, bh, x + 1, z + 1, y + 1),
-			p(cx, cy, tw, th, bh, x, z + 1, y + 1),
-		};
-		fillPolygon(context, top, lighten(baseColor, 40));
+		// 3. 几何中心对齐视口中心（结合旋转）
+		double midX = (minX + maxX) / 2.0;
+		double midZ = (minZ + maxZ) / 2.0;
+		double midY = (minY + maxY) / 2.0;
 
-		// 左面
-		int[][] left = new int[][] {
-			p(cx, cy, tw, th, bh, x, z, y),
-			p(cx, cy, tw, th, bh, x + 1, z, y),
-			p(cx, cy, tw, th, bh, x + 1, z, y + 1),
-			p(cx, cy, tw, th, bh, x, z, y + 1),
-		};
-		fillPolygon(context, left, darken(baseColor, 30));
+		double rMidX = rotX(midX, midZ, rotationIndex);
+		double rMidZ = rotZ(midX, midZ, rotationIndex);
 
-		// 右面
-		int[][] right = new int[][] {
-			p(cx, cy, tw, th, bh, x + 1, z, y),
-			p(cx, cy, tw, th, bh, x + 1, z + 1, y),
-			p(cx, cy, tw, th, bh, x + 1, z + 1, y + 1),
-			p(cx, cy, tw, th, bh, x + 1, z, y + 1),
-		};
-		fillPolygon(context, right, darken(baseColor, 60));
+		double projCenterX = (rMidX - rMidZ) * tw / 2.0;
+		double projCenterY = (rMidX + rMidZ) * th / 2.0 - midY * bh;
+		int cx = (int) Math.round(centerX - projCenterX);
+		int cy = (int) Math.round(centerY - projCenterY);
+
+		// 4. 遮挡剔除与画家算法排序
+		List<RotatedEntry> visible = new ArrayList<>();
+		for (BuildingPlan.Entry e : plan.entries) {
+			boolean topOpen = !solid.contains(posKey(e.x(), e.y() + 1, e.z()));
+			boolean face1Open = isFace1Open(solid, e.x(), e.y(), e.z(), rotationIndex);
+			boolean face2Open = isFace2Open(solid, e.x(), e.y(), e.z(), rotationIndex);
+
+			if (topOpen || face1Open || face2Open) {
+				double rx = rotX(e.x(), e.z(), rotationIndex);
+				double rz = rotZ(e.x(), e.z(), rotationIndex);
+				visible.add(new RotatedEntry(e, rx, rz, topOpen, face1Open, face2Open));
+			}
+		}
+
+		// 深度排序：由远及近（rx + rz 从小到大）、由低到高（y 从小到大）
+		visible.sort((a, b) -> {
+			double depthA = a.rx + a.rz;
+			double depthB = b.rx + b.rz;
+			if (Math.abs(depthA - depthB) > 0.001) {
+				return Double.compare(depthA, depthB);
+			}
+			return Integer.compare(a.entry.y(), b.entry.y());
+		});
+
+		// 5. 渲染各可见表面
+		for (RotatedEntry re : visible) {
+			renderRotatedBlock(context, cx, cy, tw, th, bh, re.rx, re.entry.y(), re.rz, colorOf(re.entry.blockId()),
+					re.topOpen, re.face1Open, re.face2Open);
+		}
 	}
 
-	private static int[] p(int cx, int cy, double tw, double th, double bh, int x, int z, int y) {
+	private static double rotX(double x, double z, int rot) {
+		return switch (rot) {
+			case 1 -> -z;
+			case 2 -> -x;
+			case 3 -> z;
+			default -> x;
+		};
+	}
+
+	private static double rotZ(double x, double z, int rot) {
+		return switch (rot) {
+			case 1 -> x;
+			case 2 -> -z;
+			case 3 -> -x;
+			default -> z;
+		};
+	}
+
+	private static boolean isFace1Open(Set<Long> solid, int x, int y, int z, int rot) {
+		return switch (rot) {
+			case 1 -> !solid.contains(posKey(x, y, z - 1));
+			case 2 -> !solid.contains(posKey(x - 1, y, z));
+			case 3 -> !solid.contains(posKey(x, y, z + 1));
+			default -> !solid.contains(posKey(x + 1, y, z));
+		};
+	}
+
+	private static boolean isFace2Open(Set<Long> solid, int x, int y, int z, int rot) {
+		return switch (rot) {
+			case 1 -> !solid.contains(posKey(x + 1, y, z));
+			case 2 -> !solid.contains(posKey(x, y, z - 1));
+			case 3 -> !solid.contains(posKey(x - 1, y, z));
+			default -> !solid.contains(posKey(x, y, z + 1));
+		};
+	}
+
+	private record RotatedEntry(BuildingPlan.Entry entry, double rx, double rz, boolean topOpen, boolean face1Open, boolean face2Open) {}
+
+	private static long posKey(int x, int y, int z) {
+		return (((long) (x + 200000) & 0x1FFFFFL) << 42)
+				| (((long) (y + 200000) & 0x1FFFFFL) << 21)
+				| (((long) (z + 200000) & 0x1FFFFFL));
+	}
+
+	private void renderRotatedBlock(GuiGraphicsExtractor context, int cx, int cy, double tw, double th, double bh,
+			double rx, int y, double rz, int baseColor, boolean topOpen, boolean face1Open, boolean face2Open) {
+		// 顶面
+		if (topOpen) {
+			int[][] top = new int[][] {
+				p(cx, cy, tw, th, bh, rx, rz, y + 1),
+				p(cx, cy, tw, th, bh, rx + 1, rz, y + 1),
+				p(cx, cy, tw, th, bh, rx + 1, rz + 1, y + 1),
+				p(cx, cy, tw, th, bh, rx, rz + 1, y + 1),
+			};
+			fillPolygon(context, top, lighten(baseColor, 35));
+		}
+
+		// 左前侧面
+		if (face1Open) {
+			int[][] left = new int[][] {
+				p(cx, cy, tw, th, bh, rx, rz, y),
+				p(cx, cy, tw, th, bh, rx + 1, rz, y),
+				p(cx, cy, tw, th, bh, rx + 1, rz, y + 1),
+				p(cx, cy, tw, th, bh, rx, rz, y + 1),
+			};
+			fillPolygon(context, left, darken(baseColor, 25));
+		}
+
+		// 右前侧面
+		if (face2Open) {
+			int[][] right = new int[][] {
+				p(cx, cy, tw, th, bh, rx + 1, rz, y),
+				p(cx, cy, tw, th, bh, rx + 1, rz + 1, y),
+				p(cx, cy, tw, th, bh, rx + 1, rz + 1, y + 1),
+				p(cx, cy, tw, th, bh, rx + 1, rz, y + 1),
+			};
+			fillPolygon(context, right, darken(baseColor, 50));
+		}
+	}
+
+	private static int[] p(int cx, int cy, double tw, double th, double bh, double x, double z, int y) {
 		double sx = cx + (x - z) * tw / 2.0;
 		double sy = cy + (x + z) * th / 2.0 - y * bh;
 		return new int[] { (int) Math.round(sx), (int) Math.round(sy) };
@@ -168,8 +287,39 @@ public class PlanPreviewWidget {
 		if (c != null) {
 			return c;
 		}
+		if (key.startsWith("potted_")) {
+			if (key.contains("poppy") || key.contains("tulip")) return 0xFFE53935;
+			if (key.contains("dandelion")) return 0xFFFDD835;
+			if (key.contains("cornflower")) return 0xFF1E88E5;
+			if (key.contains("flowering")) return 0xFFE91E63;
+			return 0xFF43A047;
+		}
+		if (key.contains("carpet")) {
+			if (key.contains("red")) return 0xFFD32F2F;
+			if (key.contains("blue")) return 0xFF1976D2;
+			if (key.contains("white")) return 0xFFFAFAFA;
+			if (key.contains("yellow")) return 0xFFFBC02D;
+			return 0xFFB0BEC5;
+		}
+		if (key.contains("bed")) {
+			if (key.contains("blue")) return 0xFF1976D2;
+			if (key.contains("cyan")) return 0xFF0097A7;
+			if (key.contains("white")) return 0xFFF5F5F5;
+			if (key.contains("yellow")) return 0xFFFBC02D;
+			if (key.contains("black")) return 0xFF212121;
+			return 0xFFD32F2F;
+		}
 		if (key.contains("glass")) {
 			return 0xFF81D4FA;
+		}
+		if (key.contains("cauldron") || key.contains("smoker") || key.contains("anvil")) {
+			return 0xFF455A64;
+		}
+		if (key.contains("barrel") || key.contains("chest") || key.contains("bookshelf")) {
+			return 0xFF8D6E63;
+		}
+		if (key.contains("table") || key.contains("loom")) {
+			return 0xFF9C7A4D;
 		}
 		if (key.contains("wool")) {
 			return 0xFF9E9E9E;
@@ -178,6 +328,9 @@ public class PlanPreviewWidget {
 			return 0xFFCFD8DC;
 		}
 		if (key.contains("planks") || key.contains("log") || key.contains("stair") || key.contains("slab")) {
+			if (key.contains("birch")) return 0xFFD7CCC8;
+			if (key.contains("spruce")) return 0xFF6D4C41;
+			if (key.contains("dark_oak")) return 0xFF4E342E;
 			return 0xFF795548;
 		}
 		return 0xFF8D6E63;

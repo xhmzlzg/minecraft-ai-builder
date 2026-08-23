@@ -21,17 +21,20 @@ import net.minecraft.client.gui.screens.Screen;
 import net.minecraft.client.input.PreeditEvent;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.Level;
 import net.minecraft.world.phys.Vec3;
 
 /**
- * AI 建造主界面：输入描述与坐标，生成方案，预览，确认建造。
+ * AI 建筑工作室（AI Studio）全功能主界面。
+ * 现代双栏工作台布局，自适应屏幕缩放，完整多语言（繁中 / 简中 / 英文）支持。
  */
 public class AiBuildScreen extends Screen {
-	private static final int PANEL_W = 380;
-	private static final int PANEL_H = 240;
-
 	private final PlanPreviewWidget preview = new PlanPreviewWidget();
 	private final AiConfig config;
+
+	// 左栏控件
 	private EditBox descField;
 	private EditBox posXField;
 	private EditBox posYField;
@@ -39,28 +42,150 @@ public class AiBuildScreen extends Screen {
 	private EditBox posX2Field;
 	private EditBox posY2Field;
 	private EditBox posZ2Field;
+	private Button randomButton;
+	private Button syncPosButton;
+	private Button autoSizeButton;
+	private boolean autoSize = true;
+
+	// 右栏 3D 控制
+	private Button rotLeftButton;
+	private Button rotRightButton;
+	private Button zoomInButton;
+	private Button zoomOutButton;
+	private Button resetViewButton;
+
+	// 底部动作栏
 	private Button generateButton;
 	private Button buildButton;
 	private Button undoButton;
+	private Button configButton;
 
 	private String status;
 	private boolean busy = false;
 	private BuildingPlan currentPlan;
+	private PlanSpec currentSpec;
 	private BlockPos currentOrigin;
 	private BlockPos currentBound;
 	private CompletableFuture<String> pendingTask;
 	private PreeditEvent lastPreedit;
 	private long requestStartMs;
-	private static final int STATUS_LINES = 3;
-	private static final int STATUS_LINE_H = 14;
+
+	private static final int STATUS_LINES = 6;
+	private static final int STATUS_LINE_H = 11;
 	private String lastStatus;
 	private List<String> statusLines = List.of();
 	private int statusScroll = 0;
+	private boolean hasStreamTokens = false;
+
+	private static final String[] PROMPTS_ZH_TW = {
+		"在河邊建一座兩層中式小樓，帶庭院枯山水與挑簷燈籠",
+		"建一座三層現代極簡海景別墅，帶無邊際泳池與觀景天台",
+		"建一座五層中式飛簷寶塔，帶八角挑簷與避雷尖頂",
+		"建一座賽博龐克高科技實驗大樓，配玻璃帷幕與屋頂停機坪",
+		"建一座中世紀石磚防禦城堡，帶四角箭塔與垛口天台",
+		"建一座雙層溫馨北歐森林小木屋，帶壁爐煙囪與花園露台",
+		"建一座帶鐘樓的歐式復古小教堂，配高聳拱門與彩色玻璃花窗",
+		"建一座日式和風溫泉旅館，帶中庭院落與榻榻米茶室",
+		"建一座宏偉的羅馬多立克柱廊神殿，帶三角山牆與露天祭壇",
+		"建一座帶有全景落地窗的湖畔現代美術館，帶水上木棧道",
+		"建一座八層階梯退台式現代雙子塔，帶空中觀景連廊",
+		"建一座沙漠綠洲風情的砂岩宮殿，帶立柱迴廊與噴泉中庭",
+		"建一座帶有空中花園的綠色環保摩天大樓，帶觀光電梯",
+		"建一座三層蒸汽龐克機械鐘塔，帶齒輪外掛裝飾與瞭望台",
+		"建一座林間樹屋別墅，帶吊橋連廊與露天觀星台",
+		"建一座雙層歐式莊園大宅，帶迎賓噴泉門廊與馬廄後院"
+	};
+
+	private static final String[] PROMPTS_ZH_CN = {
+		"在河边建一座两层中式小楼，带庭院枯山水与挑檐灯笼",
+		"建一座三层现代极简海景别墅，带无边泳池与观景天台",
+		"建一座五层中式飞檐宝塔，带八角挑檐与避雷尖顶",
+		"建一座赛博朋克高科技实验大楼，配玻璃帷幕与屋顶停机坪",
+		"建一座中世纪石砖防御城堡，带四角箭塔与垛口天台",
+		"建一座双层温馨北欧森林小木屋，带壁炉烟囱与花园露台",
+		"建一座带钟楼的欧式复古小教堂，配高耸拱门与彩色玻璃花窗",
+		"建一座日式和风温泉旅馆，带中庭院落与榻榻米茶室",
+		"建一座宏伟的罗马多立克柱廊神殿，带三角山墙与露天祭坛",
+		"建一座带有全景落地窗的湖畔现代艺术馆，带水上木栈道",
+		"建一座八层阶梯退台式现代双子塔，带空中观景连廊",
+		"建一座沙漠绿洲风情的砂岩宫殿，带立柱回廊与喷泉中庭",
+		"建一座带有空中花园的绿色环保摩天大楼，带观光电梯",
+		"建一座三层蒸汽朋克机械钟塔，带齿轮外挂装饰与瞭望台",
+		"建一座林间树屋别墅，带吊桥连廊与露天观星台",
+		"建一座双层欧式庄园大宅，带迎宾喷泉门廊与马厩后院"
+	};
+
+	private static final String[] PROMPTS_EN = {
+		"Build a 2-story riverside oriental pavilion with a zen garden and hanging lanterns",
+		"Build a 3-story modern minimalist seaside villa with an infinity pool and rooftop deck",
+		"Build a 5-story oriental pagoda with upturned eaves and lightning spire",
+		"Build a cyberpunk sci-fi laboratory with glass curtains and a rooftop helipad",
+		"Build a medieval stone fortress with four corner watchtowers and battlements",
+		"Build a cozy 2-story Nordic forest cabin with a fireplace chimney and flower balcony",
+		"Build a vintage European church with a clock tower, tall arches, and stained glass",
+		"Build a Japanese onsen hot-spring inn with a courtyard garden and tatami tea room",
+		"Build a majestic Roman Doric temple with pediments and an open-air altar",
+		"Build a modern lakeside art gallery with floor-to-ceiling panoramic glass windows",
+		"Build an 8-story stepped modern twin towers connected with a skybridge",
+		"Build a desert oasis sandstone palace with pillared arcades and a fountain courtyard",
+		"Build an eco-friendly green skyscraper with hanging sky gardens and glass elevators",
+		"Build a 3-story steampunk clock tower with gear ornaments and an observatory",
+		"Build a treetop forest villa with rope suspension bridges and a stargazing platform",
+		"Build a 2-story European countryside estate with a fountain porch and horse stables"
+	};
+
+	private static final java.util.Random RNG = new java.util.Random();
+
+	// 跨屏幕持久化状态（保证关闭后再打开界面，输入、蓝图、3D 预览、坐标与状态完全保留）
+	private static String savedDesc = "";
+	private static String savedX = null;
+	private static String savedY = null;
+	private static String savedZ = null;
+	private static String savedX2 = "";
+	private static String savedY2 = "";
+	private static String savedZ2 = "";
+	private static boolean savedAutoSize = true;
+	private static BuildingPlan savedPlan = null;
+	private static PlanSpec savedSpec = null;
+	private static BlockPos savedOrigin = null;
+	private static BlockPos savedBound = null;
+	private static String savedStatus = null;
+
+	private static String tr(String key, Object... args) {
+		return Component.translatable(key, args).getString();
+	}
+
+	private static String getRandomPrompt() {
+		String lang = "zh_cn";
+		if (net.minecraft.client.Minecraft.getInstance() != null && net.minecraft.client.Minecraft.getInstance().getLanguageManager() != null) {
+			lang = net.minecraft.client.Minecraft.getInstance().getLanguageManager().getSelected().toLowerCase();
+		}
+		if (lang.contains("zh_tw") || lang.contains("zh_hk") || lang.contains("traditional")) {
+			return PROMPTS_ZH_TW[RNG.nextInt(PROMPTS_ZH_TW.length)];
+		} else if (lang.contains("zh")) {
+			return PROMPTS_ZH_CN[RNG.nextInt(PROMPTS_ZH_CN.length)];
+		} else {
+			return PROMPTS_EN[RNG.nextInt(PROMPTS_EN.length)];
+		}
+	}
 
 	public AiBuildScreen(AiConfig config) {
-		super(Component.literal("AI 建造助手"));
+		super(Component.translatable("gui.minecraft-ai.studio.title"));
 		this.config = config;
-		this.status = "输入建筑描述，点击「生成方案」（当前模型：" + config.modelName() + "）";
+		this.status = savedStatus != null ? savedStatus : tr("gui.minecraft-ai.status.ready");
+		this.autoSize = savedAutoSize;
+		this.currentPlan = savedPlan;
+		this.currentSpec = savedSpec;
+		this.currentOrigin = savedOrigin;
+		this.currentBound = savedBound;
+	}
+
+	private int getPanelW() {
+		return Math.max(340, Math.min(410, this.width - 12));
+	}
+
+	private int getPanelH() {
+		return Math.max(200, Math.min(226, this.height - 12));
 	}
 
 	@Override
@@ -68,34 +193,58 @@ public class AiBuildScreen extends Screen {
 		AiClient.isAvailable(config).thenAcceptAsync(ok -> {
 			if (!ok && this.minecraft != null) {
 				this.minecraft.execute(() -> {
-					status = "警告：AI 后端不可达（" + config.chatEndpoint() + "），请检查配置或 Ollama 是否启动";
+					status = tr("gui.minecraft-ai.status.unreachable", config.chatEndpoint());
 				});
 			}
 		}, Runnable::run);
-		int cx = this.width / 2;
-		int cy = this.height / 2;
 
-		int x0 = cx - PANEL_W / 2;
-		int y0 = cy - PANEL_H / 2;
+		int panelW = getPanelW();
+		int panelH = getPanelH();
+		int x0 = (this.width - panelW) / 2;
+		int y0 = (this.height - panelH) / 2;
 
-		// 默认位置：玩家面前 10 格
+		int colLeftW = (panelW - 20) * 48 / 100;
+		int colRightW = (panelW - 20) - colLeftW;
+		int leftX = x0 + 7;
+		int rightX = leftX + colLeftW + 6;
+
 		BlockPos start = defaultOrigin();
 
-		descField = new EditBox(this.font, x0 + 10, y0 + 22, PANEL_W - 20, 20,
-				Component.literal("建筑描述"));
+		// ===== 顶部设置按钮 =====
+		configButton = Button.builder(Component.translatable("gui.minecraft-ai.btn.settings"), b -> {
+			if (this.minecraft != null) {
+				saveState();
+				ScreenCompat.setScreen(this.minecraft, new AiConfigScreen(config));
+			}
+		}).bounds(x0 + panelW - 52, y0 + 3, 46, 15).build();
+		addRenderableWidget(configButton);
+
+		// ===== 左栏：输入与控制 =====
+		// 1. 建筑描述
+		descField = new EditBox(this.font, leftX, y0 + 29, colLeftW - 44, 15, Component.literal("建筑描述"));
 		descField.setMaxLength(10000);
-		descField.setHint(Component.literal("例：在河边建一座两层中式小楼，带院子"));
+		descField.setHint(Component.translatable("gui.minecraft-ai.hint.desc"));
+		descField.setValue(savedDesc);
 		addRenderableWidget(descField);
 		setInitialFocus(descField);
 
-		int fieldY = y0 + 54;
-		int fieldW = 60;
-		posXField = new EditBox(this.font, x0 + 70, fieldY, fieldW, 16, Component.literal("X"));
-		posYField = new EditBox(this.font, x0 + 140, fieldY, fieldW, 16, Component.literal("Y"));
-		posZField = new EditBox(this.font, x0 + 210, fieldY, fieldW, 16, Component.literal("Z"));
-		posXField.setValue(String.valueOf(start.getX()));
-		posYField.setValue(String.valueOf(start.getY()));
-		posZField.setValue(String.valueOf(start.getZ()));
+		randomButton = Button.builder(Component.translatable("gui.minecraft-ai.btn.inspiration"), b -> {
+			String idea = getRandomPrompt();
+			descField.setValue(idea);
+			status = tr("gui.minecraft-ai.status.inspiration_picked", idea);
+			saveState();
+		}).bounds(leftX + colLeftW - 41, y0 + 29, 41, 15).build();
+		addRenderableWidget(randomButton);
+
+		// 2. 起点坐标
+		int coordY = y0 + 57;
+		int coordW = (colLeftW - 54) / 3;
+		posXField = new EditBox(this.font, leftX, coordY, coordW, 14, Component.literal("X"));
+		posYField = new EditBox(this.font, leftX + coordW + 2, coordY, coordW, 14, Component.literal("Y"));
+		posZField = new EditBox(this.font, leftX + (coordW + 2) * 2, coordY, coordW, 14, Component.literal("Z"));
+		posXField.setValue(savedX != null ? savedX : String.valueOf(start.getX()));
+		posYField.setValue(savedY != null ? savedY : String.valueOf(start.getY()));
+		posZField.setValue(savedZ != null ? savedZ : String.valueOf(start.getZ()));
 		posXField.setMaxLength(10);
 		posYField.setMaxLength(10);
 		posZField.setMaxLength(10);
@@ -103,48 +252,82 @@ public class AiBuildScreen extends Screen {
 		addRenderableWidget(posYField);
 		addRenderableWidget(posZField);
 
-		// 第二组坐标：空间终点（可留空 = 不限空间）
-		int fieldY2 = y0 + 74;
-		posX2Field = new EditBox(this.font, x0 + 70, fieldY2, fieldW, 16, Component.literal("X2"));
-		posY2Field = new EditBox(this.font, x0 + 140, fieldY2, fieldW, 16, Component.literal("Y2"));
-		posZ2Field = new EditBox(this.font, x0 + 210, fieldY2, fieldW, 16, Component.literal("Z2"));
-		posX2Field.setHint(Component.literal("终点X"));
-		posY2Field.setHint(Component.literal("终点Y"));
-		posZ2Field.setHint(Component.literal("终点Z"));
+		syncPosButton = Button.builder(Component.translatable("gui.minecraft-ai.btn.feet"), b -> {
+			BlockPos cur = defaultOrigin();
+			posXField.setValue(String.valueOf(cur.getX()));
+			posYField.setValue(String.valueOf(cur.getY()));
+			posZField.setValue(String.valueOf(cur.getZ()));
+			status = tr("gui.minecraft-ai.status.sync_pos", cur.getX(), cur.getY(), cur.getZ());
+			saveState();
+		}).bounds(leftX + colLeftW - 48, coordY, 48, 14).build();
+		addRenderableWidget(syncPosButton);
+
+		// 3. 空间尺寸规划
+		int sizeY = y0 + 84;
+		int autoBtnW = 84;
+		autoSizeButton = Button.builder(Component.translatable(autoSize ? "gui.minecraft-ai.btn.autosize_on" : "gui.minecraft-ai.btn.autosize_off"), b -> {
+			autoSize = !autoSize;
+			updateAutoSizeState();
+			saveState();
+		}).bounds(leftX, sizeY, autoBtnW, 15).build();
+		addRenderableWidget(autoSizeButton);
+
+		int boundW = (colLeftW - autoBtnW - 8) / 3;
+		posX2Field = new EditBox(this.font, leftX + autoBtnW + 2, sizeY, boundW, 15, Component.literal("X2"));
+		posY2Field = new EditBox(this.font, leftX + autoBtnW + 2 + boundW + 2, sizeY, boundW, 15, Component.literal("Y2"));
+		posZ2Field = new EditBox(this.font, leftX + autoBtnW + 2 + (boundW + 2) * 2, sizeY, colLeftW - (autoBtnW + 2 + (boundW + 2) * 2), 15, Component.literal("Z2"));
+		posX2Field.setValue(savedX2);
+		posY2Field.setValue(savedY2);
+		posZ2Field.setValue(savedZ2);
 		posX2Field.setMaxLength(10);
 		posY2Field.setMaxLength(10);
 		posZ2Field.setMaxLength(10);
 		addRenderableWidget(posX2Field);
 		addRenderableWidget(posY2Field);
 		addRenderableWidget(posZ2Field);
+		updateAutoSizeState();
 
-		// 预览区域
-		preview.setViewport(x0 + PANEL_W / 2, y0 + 131, PANEL_W - 16, 56);
+		// ===== 右栏：3D 视口与控制 =====
+		int viewH = panelH - 96;
+		preview.setViewport(rightX + colRightW / 2, y0 + 19 + viewH / 2, colRightW - 4, viewH - 4);
+		if (savedPlan != null) {
+			preview.setPlan(savedPlan);
+		}
 
-		generateButton = Button.builder(Component.literal("生成方案"),
-				b -> requestPlan())
-				.bounds(x0 + 10, y0 + PANEL_H - 26, 80, 20)
-				.build();
-		buildButton = Button.builder(Component.literal("确认建造"),
-				b -> executeBuild())
-				.bounds(x0 + 100, y0 + PANEL_H - 26, 80, 20)
-				.build();
-		undoButton = Button.builder(Component.literal("撤销上次"),
-				b -> undoBuild())
-				.bounds(x0 + 190, y0 + PANEL_H - 26, 80, 20)
-				.build();
-		Button configButton = Button.builder(Component.literal("设置"),
-				b -> {
-					if (this.minecraft != null) {
-						this.minecraft.setScreen(new AiConfigScreen(config));
-					}
-				})
-				.bounds(x0 + 290, y0 + PANEL_H - 26, 80, 20)
-				.build();
+		int bar3DY = y0 + panelH - 73;
+		int btn3DW = (colRightW - 10) / 5;
+		rotLeftButton = Button.builder(Component.translatable("gui.minecraft-ai.btn.rot_ccw"), b -> preview.rotateCCW())
+				.bounds(rightX, bar3DY, btn3DW, 15).build();
+		rotRightButton = Button.builder(Component.translatable("gui.minecraft-ai.btn.rot_cw"), b -> preview.rotateCW())
+				.bounds(rightX + btn3DW + 2, bar3DY, btn3DW, 15).build();
+		zoomInButton = Button.builder(Component.translatable("gui.minecraft-ai.btn.zoom_in"), b -> preview.zoomIn())
+				.bounds(rightX + (btn3DW + 2) * 2, bar3DY, btn3DW, 15).build();
+		zoomOutButton = Button.builder(Component.translatable("gui.minecraft-ai.btn.zoom_out"), b -> preview.zoomOut())
+				.bounds(rightX + (btn3DW + 2) * 3, bar3DY, btn3DW, 15).build();
+		resetViewButton = Button.builder(Component.translatable("gui.minecraft-ai.btn.reset_view"), b -> preview.resetView())
+				.bounds(rightX + (btn3DW + 2) * 4, bar3DY, colRightW - (btn3DW + 2) * 4, 15).build();
+
+		addRenderableWidget(rotLeftButton);
+		addRenderableWidget(rotRightButton);
+		addRenderableWidget(zoomInButton);
+		addRenderableWidget(zoomOutButton);
+		addRenderableWidget(resetViewButton);
+
+		// ===== 底部操作栏 =====
+		int actionY = y0 + panelH - 24;
+		int actionBtnW = (panelW - 20) / 3;
+		generateButton = Button.builder(Component.translatable("gui.minecraft-ai.btn.generate"), b -> requestPlan())
+				.bounds(leftX, actionY, actionBtnW, 19).build();
+		buildButton = Button.builder(Component.translatable("gui.minecraft-ai.btn.build"), b -> executeBuild())
+				.bounds(leftX + actionBtnW + 3, actionY, actionBtnW, 19).build();
+		undoButton = Button.builder(Component.translatable("gui.minecraft-ai.btn.undo"), b -> undoBuild())
+				.bounds(leftX + (actionBtnW + 3) * 2, actionY, panelW - 14 - (actionBtnW + 3) * 2, 19).build();
+
 		addRenderableWidget(generateButton);
 		addRenderableWidget(buildButton);
 		addRenderableWidget(undoButton);
-		addRenderableWidget(configButton);
+
+		updateButtons();
 	}
 
 	private BlockPos defaultOrigin() {
@@ -160,39 +343,50 @@ public class AiBuildScreen extends Screen {
 		return new BlockPos(0, 64, 0);
 	}
 
-	/** 从玩家描述提取明确楼层数（如"20 层"、"至少 15 层"、"层数 8"）；没有则 null */
-	private static Integer extractFloorHint(String description) {
-		if (description == null) {
-			return null;
+	private void updateAutoSizeState() {
+		if (posX2Field == null || posY2Field == null || posZ2Field == null) {
+			return;
 		}
-		java.util.regex.Matcher m = java.util.regex.Pattern
-				.compile("(\\d+)\\s*(?:楼)?层|层(?:数)?\\s*(?:为|=)?\\s*(\\d+)").matcher(description);
-		if (m.find()) {
-			String v = m.group(1) != null ? m.group(1) : m.group(2);
-			if (v != null) {
-				return Integer.parseInt(v);
+		if (autoSize) {
+			posX2Field.setValue("");
+			posY2Field.setValue("");
+			posZ2Field.setValue("");
+			posX2Field.setEditable(false);
+			posY2Field.setEditable(false);
+			posZ2Field.setEditable(false);
+			posX2Field.setHint(Component.literal("X2"));
+			posY2Field.setHint(Component.literal("Y2"));
+			posZ2Field.setHint(Component.literal("Z2"));
+			if (autoSizeButton != null) {
+				autoSizeButton.setMessage(Component.translatable("gui.minecraft-ai.btn.autosize_on"));
+			}
+		} else {
+			posX2Field.setEditable(true);
+			posY2Field.setEditable(true);
+			posZ2Field.setEditable(true);
+			posX2Field.setHint(Component.literal("X2"));
+			posY2Field.setHint(Component.literal("Y2"));
+			posZ2Field.setHint(Component.literal("Z2"));
+			if (autoSizeButton != null) {
+				autoSizeButton.setMessage(Component.translatable("gui.minecraft-ai.btn.autosize_off"));
 			}
 		}
-		return null;
 	}
 
 	private void requestPlan() {
-		if (busy) {
-			return;
-		}
 		String desc = descField.getValue().trim();
 		if (desc.isEmpty()) {
-			status = "请先输入建筑描述";
+			status = tr("gui.minecraft-ai.status.prompt_empty");
 			return;
 		}
+
 		BlockPos origin = readOrigin();
 		if (origin == null) {
-			status = "坐标格式错误，请输入整数 X Y Z";
+			status = tr("gui.minecraft-ai.status.invalid_origin");
 			return;
 		}
-		BlockPos bound = readBound();
+		BlockPos bound = autoSize ? null : readBound();
 		if (bound != null) {
-			// 归一化：无论先输入哪一角，都取 min 为起点、max 为终点
 			BlockPos lo = new BlockPos(Math.min(origin.getX(), bound.getX()),
 					Math.min(origin.getY(), bound.getY()), Math.min(origin.getZ(), bound.getZ()));
 			BlockPos hi = new BlockPos(Math.max(origin.getX(), bound.getX()),
@@ -206,18 +400,41 @@ public class AiBuildScreen extends Screen {
 		currentOrigin = origin;
 		currentBound = bound;
 		requestStartMs = System.currentTimeMillis();
-		status = "AI 设计中…（约 10~90 秒，AI 正在画楼层蓝图）";
+		status = tr("gui.minecraft-ai.status.sending");
 
 		String posText = origin.getX() + " " + origin.getY() + " " + origin.getZ();
-		if (bound != null) {
+		if (!autoSize && bound != null) {
 			int w = bound.getX() - origin.getX() + 1;
 			int d = bound.getZ() - origin.getZ() + 1;
 			int h = bound.getY() - origin.getY() + 1;
-			posText += "，可用空间立方体：从 (" + origin.getX() + " " + origin.getY() + " " + origin.getZ()
+			posText += "，指定建筑空间范围：从 (" + origin.getX() + " " + origin.getY() + " " + origin.getZ()
 					+ ") 到 (" + bound.getX() + " " + bound.getY() + " " + bound.getZ()
-					+ ")（宽 " + w + " 深 " + d + " 高 " + h + "），建筑要尽量填满这个空间，但绝不能超出它的范围";
+					+ ")（宽 " + w + " 深 " + d + " 高 " + h + "），建筑必须严格在此空间内设计";
+		} else {
+			posText += "，空间大小由你自主规划：请根据建筑类型与风格（例如小型住宅 8~12格、中型别墅 14~18格、宏伟城堡/高楼 20~28格、层高3~5格）自主决定最和谐的宽度、进深与层数！";
 		}
-		pendingTask = AiClient.askPlan(desc, posText, config);
+
+		hasStreamTokens = false;
+		pendingTask = AiClient.askPlan(desc, posText, config, (thinking, content) -> {
+			if (this.minecraft == null) {
+				return;
+			}
+			this.minecraft.execute(() -> {
+				if (!busy) {
+					return;
+				}
+				hasStreamTokens = true;
+				long s = (System.currentTimeMillis() - requestStartMs) / 1000;
+				if (content.isEmpty() && !thinking.isEmpty()) {
+					String tail = getTail(thinking, 90).replace("\r", "").replace("\n", " ").trim();
+					status = tr("gui.minecraft-ai.status.thinking", s, tail);
+				} else if (!content.isEmpty()) {
+					String tail = getTail(content, 90).replace("\r", "").replace("\n", " ").trim();
+					status = tr("gui.minecraft-ai.status.drawing", s, content.length(), tail);
+				}
+			});
+		});
+
 		pendingTask.whenComplete((reply, error) -> {
 			if (this.minecraft == null) {
 				return;
@@ -226,35 +443,26 @@ public class AiBuildScreen extends Screen {
 				busy = false;
 				pendingTask = null;
 				if (error != null) {
-					status = "出错：" + rootMessage(error);
+					status = tr("gui.minecraft-ai.status.parse_error", rootMessage(error));
 					updateButtons();
 					return;
 				}
-try {
+				try {
 					PlanSpec spec = PlanParser.parse(reply);
-					PlanParser.applyFloorHint(spec, extractFloorHint(desc));
-					MinecraftAIMod.LOGGER.info("[Minecraft AI] AI 回复: {}", reply);
-					MinecraftAIMod.LOGGER.info("[Minecraft AI] 解析方案: name={} floors={} wall={} accent={} roof={} interiors={} repeat={} maps={}",
-							spec.name, spec.floors, spec.wall, spec.accent, spec.roof, spec.interiors, spec.repeat,
-							spec.floorsMap == null ? 0 : spec.floorsMap.size());
-					currentPlan = PlanGenerator.generate(spec, desc);
-					preview.setPlan(currentPlan);
-					status = "方案「" + currentPlan.name + "」已生成：" + currentPlan.width + "x" + currentPlan.height
-							+ "x" + currentPlan.depth + "，共 " + currentPlan.size() + " 个方块。确认后建造于 "
-							+ currentOrigin.getX() + ", " + currentOrigin.getY() + ", " + currentOrigin.getZ();
-					if (currentBound != null) {
-						String over = overBoundText(currentPlan, currentOrigin, currentBound);
-						if (over != null) {
-							status += "。" + over + "（确认建造将按完整方案放置，不做裁剪）";
-						}
-					}
-				} catch (IllegalArgumentException e) {
-					status = "AI 方案解析失败：" + e.getMessage() + "（可点「生成方案」重试）";
+					BuildingPlan plan = PlanGenerator.generate(spec, desc);
+					this.currentPlan = plan;
+					this.currentSpec = spec;
+					preview.setPlan(plan);
+					preview.resetView();
+					long totalS = (System.currentTimeMillis() - requestStartMs) / 1000;
+					status = tr("gui.minecraft-ai.status.plan_done", totalS);
+					saveState();
+				} catch (Exception e) {
+					status = tr("gui.minecraft-ai.status.parse_error", e.getMessage());
 				}
 				updateButtons();
 			});
 		});
-		updateButtons();
 	}
 
 	private void executeBuild() {
@@ -262,21 +470,29 @@ try {
 			return;
 		}
 		if (this.minecraft == null || this.minecraft.getSingleplayerServer() == null) {
-			status = "仅支持单人游戏！多人服务器需要服务器端支持";
+			status = tr("gui.minecraft-ai.status.singleplayer_only");
 			return;
 		}
 		try {
 			var server = this.minecraft.getSingleplayerServer();
-			var world = server.getLevel(this.minecraft.level.dimension());
+			ResourceKey<Level> dimKey = Level.OVERWORLD;
+			if (this.minecraft.player != null && this.minecraft.player.level() != null) {
+				dimKey = this.minecraft.player.level().dimension();
+			} else if (this.minecraft.level != null) {
+				dimKey = this.minecraft.level.dimension();
+			}
+			ServerLevel world = server.getLevel(dimKey);
 			if (world == null) {
-				status = "建造失败：找不到当前维度";
+				world = server.overworld();
+			}
+			if (world == null) {
+				status = tr("gui.minecraft-ai.status.no_dimension");
 				return;
 			}
 			busy = true;
 			updateButtons();
-			status = "正在建造「" + currentPlan.name + "」…";
-			// 用户确认建造 = 接受可能超出空间，按 AI 完整方案放置，不做裁剪
-			var future = BuildingExecutor.execute(server, world, currentOrigin, currentPlan, null);
+			status = tr("gui.minecraft-ai.status.building", currentPlan.name);
+			var future = BuildingExecutor.execute(server, world, currentOrigin, currentPlan, currentBound);
 			future.whenComplete((placed, error) -> {
 				if (this.minecraft == null) {
 					return;
@@ -284,15 +500,16 @@ try {
 				this.minecraft.execute(() -> {
 					busy = false;
 					if (error != null) {
-						status = "建造失败：" + rootMessage(error);
+						status = tr("gui.minecraft-ai.status.build_error", rootMessage(error));
 					} else {
-						status = "建造完成！共放置 " + placed + " 个方块，可点「撤销上次」恢复";
+						status = tr("gui.minecraft-ai.status.build_success", placed);
 					}
+					saveState();
 					updateButtons();
 				});
 			});
 		} catch (Exception e) {
-			status = "建造失败：" + e.getMessage();
+			status = tr("gui.minecraft-ai.status.build_error", e.getMessage());
 		}
 	}
 
@@ -301,20 +518,27 @@ try {
 			return;
 		}
 		var server = this.minecraft.getSingleplayerServer();
-		status = "撤销中…";
+		busy = true;
+		updateButtons();
+		status = tr("gui.minecraft-ai.status.undoing");
 		var future = BuildingExecutor.undo(server);
 		future.whenComplete((ok, error) -> {
 			if (this.minecraft == null) {
 				return;
 			}
 			this.minecraft.execute(() -> {
+				busy = false;
 				if (error != null) {
-					status = "撤销失败：" + rootMessage(error);
+					status = tr("gui.minecraft-ai.status.undo_error", rootMessage(error));
 				} else if (Boolean.TRUE.equals(ok)) {
-					status = "已撤销上次建造";
+					status = tr("gui.minecraft-ai.status.undo_success");
+					currentPlan = null;
+					currentSpec = null;
+					preview.setPlan(null);
 				} else {
-					status = "没有可撤销的建造记录";
+					status = tr("gui.minecraft-ai.status.undo_empty");
 				}
+				saveState();
 				updateButtons();
 			});
 		});
@@ -331,43 +555,8 @@ try {
 		}
 	}
 
-	/**
-	 * 计算建筑相对空间约束 origin..bound 的超出量。
-	 * 返回描述文本；不超出返回 null。
-	 */
-	private static String overBoundText(BuildingPlan plan, BlockPos origin, BlockPos bound) {
-		int minX = Integer.MAX_VALUE, maxX = Integer.MIN_VALUE;
-		int minY = Integer.MAX_VALUE, maxY = Integer.MIN_VALUE;
-		int minZ = Integer.MAX_VALUE, maxZ = Integer.MIN_VALUE;
-		for (BuildingPlan.Entry e : plan.entries) {
-			minX = Math.min(minX, e.x());
-			maxX = Math.max(maxX, e.x());
-			minY = Math.min(minY, e.y());
-			maxY = Math.max(maxY, e.y());
-			minZ = Math.min(minZ, e.z());
-			maxZ = Math.max(maxZ, e.z());
-		}
-		StringBuilder over = new StringBuilder();
-		int overWest = origin.getX() - (origin.getX() + minX);
-		int overEast = (origin.getX() + maxX) - bound.getX();
-		int overDown = origin.getY() - (origin.getY() + minY);
-		int overUp = (origin.getY() + maxY) - bound.getY();
-		int overNorth = origin.getZ() - (origin.getZ() + minZ);
-		int overSouth = (origin.getZ() + maxZ) - bound.getZ();
-		if (overWest > 0) over.append("西侧 ").append(overWest).append(" 格；");
-		if (overEast > 0) over.append("东侧 ").append(overEast).append(" 格；");
-		if (overDown > 0) over.append("下方 ").append(overDown).append(" 格；");
-		if (overUp > 0) over.append("上方 ").append(overUp).append(" 格；");
-		if (overNorth > 0) over.append("北侧 ").append(overNorth).append(" 格；");
-		if (overSouth > 0) over.append("南侧 ").append(overSouth).append(" 格；");
-		if (over.length() == 0) {
-			return null;
-		}
-		return "建筑超出空间：" + over.substring(0, over.length() - 1);
-	}
-
-	/** 空间终点坐标；留空返回 null（不限空间） */
-	private BlockPos readBound() {		String sx = posX2Field.getValue().trim();
+	private BlockPos readBound() {
+		String sx = posX2Field.getValue().trim();
 		String sy = posY2Field.getValue().trim();
 		String sz = posZ2Field.getValue().trim();
 		if (sx.isEmpty() && sy.isEmpty() && sz.isEmpty()) {
@@ -383,7 +572,11 @@ try {
 	private void updateButtons() {
 		generateButton.active = !busy;
 		buildButton.active = currentPlan != null && !busy;
-		undoButton.active = BuildingExecutor.canUndo();
+		undoButton.active = BuildingExecutor.canUndo() && !busy;
+		if (randomButton != null) randomButton.active = !busy;
+		if (syncPosButton != null) syncPosButton.active = !busy;
+		if (autoSizeButton != null) autoSizeButton.active = !busy;
+		if (configButton != null) configButton.active = !busy;
 	}
 
 	private static String rootMessage(Throwable t) {
@@ -395,35 +588,134 @@ try {
 	}
 
 	@Override
-	public void extractRenderState(GuiGraphicsExtractor context, int mouseX, int mouseY, float delta) {
-		int cx = this.width / 2;
-		int cy = this.height / 2;
-		int x0 = cx - PANEL_W / 2;
-		int y0 = cy - PANEL_H / 2;
+	public boolean keyPressed(net.minecraft.client.input.KeyEvent event) {
+		int keyCode = event.key();
+		if (keyCode == 257 || keyCode == 335) { // Enter or Keypad Enter
+			if (descField != null && descField.isFocused() && !busy) {
+				requestPlan();
+				return true;
+			}
+		}
+		if (keyCode == 32) { // Space
+			if ((descField == null || !descField.isFocused())
+					&& (posXField == null || !posXField.isFocused())
+					&& (posYField == null || !posYField.isFocused())
+					&& (posZField == null || !posZField.isFocused())
+					&& currentPlan != null && !busy) {
+				executeBuild();
+				return true;
+			}
+		}
+		return super.keyPressed(event);
+	}
 
-		// 面板背景：画在 widgets 下层（先画），物品栏风格的深色半透明
-		context.fill(x0 - 4, y0 - 4, x0 + PANEL_W + 4, y0 + PANEL_H + 4, 0xC0101010);
-		context.fill(x0, y0, x0 + PANEL_W, y0 + PANEL_H, 0xE62A2F38);
-		// 预览区背景
-		context.fill(x0, y0 + 96, x0 + PANEL_W, y0 + 162, 0xB0000000);
+	@Override
+	public boolean mouseScrolled(double mouseX, double mouseY, double horizontalAmount, double verticalAmount) {
+		int panelW = getPanelW();
+		int panelH = getPanelH();
+		int x0 = (this.width - panelW) / 2;
+		int y0 = (this.height - panelH) / 2;
+
+		int colLeftW = (panelW - 20) * 48 / 100;
+		int colRightW = (panelW - 20) - colLeftW;
+		int leftX = x0 + 7;
+		int rightX = leftX + colLeftW + 6;
+		int viewH = panelH - 96;
+
+		// 1. 如果在 3D 视口内：滚轮缩放
+		if (mouseX >= rightX && mouseX <= rightX + colRightW && mouseY >= y0 + 19 && mouseY <= y0 + 19 + viewH) {
+			if (verticalAmount > 0) {
+				preview.zoomIn();
+			} else if (verticalAmount < 0) {
+				preview.zoomOut();
+			}
+			return true;
+		}
+
+		// 2. 如果在控制台区域内：滚轮滚动日志
+		int consoleY = y0 + 112;
+		int consoleH = panelH - 140;
+		if (mouseX >= leftX && mouseX <= leftX + colLeftW && mouseY >= consoleY && mouseY <= consoleY + consoleH) {
+			int maxScroll = Math.max(0, statusLines.size() - STATUS_LINES);
+			if (maxScroll > 0) {
+				statusScroll = Math.max(0, Math.min(statusScroll + (int) verticalAmount, maxScroll));
+				return true;
+			}
+		}
+
+		return super.mouseScrolled(mouseX, mouseY, horizontalAmount, verticalAmount);
+	}
+
+	@Override
+	public void extractRenderState(GuiGraphicsExtractor context, int mouseX, int mouseY, float delta) {
+		int panelW = getPanelW();
+		int panelH = getPanelH();
+		int x0 = (this.width - panelW) / 2;
+		int y0 = (this.height - panelH) / 2;
+
+		int colLeftW = (panelW - 20) * 48 / 100;
+		int colRightW = (panelW - 20) - colLeftW;
+		int leftX = x0 + 7;
+		int rightX = leftX + colLeftW + 6;
+		int viewH = panelH - 96;
+		int consoleY = y0 + 112;
+		int consoleH = panelH - 140;
+
+		// 1. 面板深色亚克力背景与发光外框
+		context.fill(x0 - 2, y0 - 2, x0 + panelW + 2, y0 + panelH + 2, 0xC00A0D12);
+		context.fill(x0, y0, x0 + panelW, y0 + panelH, 0xEE1E2430);
+
+		// 2. 左右双栏卡片背景
+		// 左栏卡片：控制台背景
+		context.fill(leftX, consoleY, leftX + colLeftW, consoleY + consoleH, 0xD00D1117);
+		// 右栏卡片：3D 视口背景
+		context.fill(rightX, y0 + 19, rightX + colRightW, y0 + 19 + viewH, 0xD00D1117);
+		// 右栏卡片：蓝图信息卡背景
+		int cardY = y0 + panelH - 54;
+		context.fill(rightX, cardY, rightX + colRightW, cardY + 26, 0xD0161B22);
 
 		super.extractRenderState(context, mouseX, mouseY, delta);
 
-		// 标题与标签（最后画，保证在最上层）。标题放在面板内顶部，避免窗口小时出屏
-		context.centeredText(this.font, "AI 建造助手", cx, y0 + 4, 0xFFFFFFFF);
-		context.text(this.font, "起点：", x0 + 10, y0 + 57, 0xFFE0E0E0);
-		context.text(this.font, "终点：", x0 + 10, y0 + 77, 0xFFE0E0E0);
-		context.centeredText(this.font, "3D 预览", cx, y0 + 100, 0xFFC0C0C0);
+		// 3. 顶部 Header 渲染
+		context.text(this.font, tr("gui.minecraft-ai.studio.title"), x0 + 8, y0 + 6, 0xFFFFFFFF);
+		String modelBadge = "[" + config.modelName() + "]";
+		int badgeW = this.font.width(modelBadge);
+		context.text(this.font, modelBadge, x0 + panelW - 56 - badgeW, y0 + 6, 0xFF81D4FA);
 
-		preview.setViewport(x0 + PANEL_W / 2, y0 + 131, PANEL_W - 16, 56);
+		// 4. 左栏标签
+		context.text(this.font, tr("gui.minecraft-ai.label.desc"), leftX, y0 + 20, 0xFFC0C0C0);
+		context.text(this.font, tr("gui.minecraft-ai.label.origin"), leftX, y0 + 47, 0xFFC0C0C0);
+		context.text(this.font, tr("gui.minecraft-ai.label.space"), leftX, y0 + 74, 0xFFC0C0C0);
+		context.text(this.font, tr("gui.minecraft-ai.label.console"), leftX, y0 + 102, 0xFFC0C0C0);
+
+		// 5. 3D 预览视口与蓝图信息
+		preview.setViewport(rightX + colRightW / 2, y0 + 19 + viewH / 2, colRightW - 4, viewH - 4);
 		preview.render(context);
 
-		drawStatus(context, x0 + 10, y0 + 168, PANEL_W - 20);
+		// 视口右上角角度提示
+		if (preview.hasPlan()) {
+			String angleText = preview.getRotationDegrees() + "°";
+			context.text(this.font, angleText, rightX + colRightW - this.font.width(angleText) - 4, y0 + 23, 0xFF80DEEA);
+		} else {
+			context.centeredText(this.font, tr("gui.minecraft-ai.preview.empty"), rightX + colRightW / 2, y0 + 19 + viewH / 2 - 4, 0xFF556070);
+		}
+
+		// 蓝图信息卡渲染
+		if (currentPlan != null && currentSpec != null) {
+			String line1 = tr("gui.minecraft-ai.card.info1", currentSpec.name, currentPlan.width, currentPlan.depth, currentPlan.height);
+			String line2 = tr("gui.minecraft-ai.card.info2", currentPlan.entries.size(), currentSpec.floors);
+			context.text(this.font, line1, rightX + 4, cardY + 3, 0xFFFFFFFF);
+			context.text(this.font, line2, rightX + 4, cardY + 14, 0xFF81C784);
+		} else {
+			context.text(this.font, tr("gui.minecraft-ai.card.empty"), rightX + 6, cardY + 9, 0xFF718096);
+		}
+
+		// 6. 控制台状态文本绘制
+		drawStatus(context, leftX + 4, consoleY + 4, colLeftW - 8);
 
 		drawImePreview(context);
 	}
 
-	/** 状态文本：超宽时按字符宽度拆行，最多显示 3 行；行数更多时滚轮滚动查看 */
 	private void drawStatus(GuiGraphicsExtractor context, int x, int y, int maxWidth) {
 		if (!status.equals(lastStatus)) {
 			lastStatus = status;
@@ -431,22 +723,14 @@ try {
 			statusScroll = 0;
 		}
 		int n = statusLines.size();
-		if (n == 0) {
-			return;
-		}
-		if (n <= STATUS_LINES) {
-			for (int i = 0; i < n; i++) {
-				context.text(this.font, statusLines.get(i), x, y + i * STATUS_LINE_H, statusColor());
-			}
-			return;
-		}
-		int maxScroll = n - STATUS_LINES;
-		if (statusScroll > maxScroll) {
-			statusScroll = maxScroll;
-		}
-		int start = n - STATUS_LINES - statusScroll;
-		for (int i = 0; i < STATUS_LINES; i++) {
-			context.text(this.font, statusLines.get(start + i), x, y + i * STATUS_LINE_H, statusColor());
+		int maxScroll = Math.max(0, n - STATUS_LINES);
+		if (statusScroll > maxScroll) statusScroll = maxScroll;
+		
+		int start = Math.max(0, n - STATUS_LINES - statusScroll);
+		int end = Math.min(n, start + STATUS_LINES);
+		
+		for (int i = start; i < end; i++) {
+			context.text(this.font, statusLines.get(i), x, y + (i - start) * STATUS_LINE_H, statusColor());
 		}
 	}
 
@@ -466,44 +750,41 @@ try {
 			int w = 0;
 			while (cut < rest.length()) {
 				int cw = this.font.width(String.valueOf(rest.charAt(cut)));
-				if (w + cw > maxWidth) {
-					break;
-				}
+				if (w + cw > maxWidth) break;
 				w += cw;
 				cut++;
 			}
-			if (cut == 0) {
-				cut = 1;
-			}
+			if (cut == 0) cut = 1;
 			lines.add(rest.substring(0, cut));
 			rest = rest.substring(cut);
 		}
 		return lines;
 	}
 
-	/** 鼠标滚轮：状态文本超过 3 行时滚动查看（向上滚看更早的内容） */
-	@Override
-	public boolean mouseScrolled(double mouseX, double mouseY, double horizontalAmount, double verticalAmount) {
-		int maxScroll = Math.max(0, statusLines.size() - STATUS_LINES);
-		if (maxScroll > 0) {
-			statusScroll = Math.max(0, Math.min(statusScroll + (int) verticalAmount, maxScroll));
-			return true;
-		}
-		return super.mouseScrolled(mouseX, mouseY, horizontalAmount, verticalAmount);
-	}
-
 	private int statusColor() {
-		if (status.startsWith("出错") || status.startsWith("AI 方案解析失败") || status.startsWith("建造失败")
-				|| status.startsWith("撤销失败")) {
+		if (status.contains("❌") || status.startsWith("出错") || status.startsWith("警告") || status.startsWith("建造失败")
+				|| status.startsWith("撤销失败") || status.startsWith("Error") || status.startsWith("Warning")) {
 			return 0xFFFF5555;
 		}
-		if (status.startsWith("AI 思考中") || status.startsWith("正在建造") || status.startsWith("撤销中")) {
+		if (status.contains("⚡") || status.contains("✏️") || status.startsWith("正在") || status.startsWith("🔨")
+				|| status.startsWith("AI") || status.startsWith("Building") || status.startsWith("Undoing")) {
 			return 0xFFFFC94F;
 		}
-		if (status.startsWith("建造完成")) {
+		if (status.contains("🎉") || status.contains("✅") || status.startsWith("建造完成") || status.startsWith("撤销成功")
+				|| status.startsWith("Build") || status.startsWith("Undo")) {
 			return 0xFF4ADE80;
 		}
 		return 0xFF66FF66;
+	}
+
+	private static String getTail(String s, int maxLen) {
+		if (s == null) {
+			return "";
+		}
+		if (s.length() <= maxLen) {
+			return s;
+		}
+		return "…" + s.substring(s.length() - maxLen);
 	}
 
 	@Override
@@ -549,12 +830,31 @@ try {
 		super.tick();
 		if (busy && pendingTask != null && !pendingTask.isDone()) {
 			long s = (System.currentTimeMillis() - requestStartMs) / 1000;
-			status = "AI 设计中…（已等待 " + s + " 秒，AI 正在画楼层蓝图）";
+			if (!hasStreamTokens) {
+				status = "AI 连接中…（已等待 " + s + " 秒，等待 AI 响应）";
+			}
 		}
+	}
+
+	private void saveState() {
+		if (descField != null) savedDesc = descField.getValue();
+		if (posXField != null) savedX = posXField.getValue();
+		if (posYField != null) savedY = posYField.getValue();
+		if (posZField != null) savedZ = posZField.getValue();
+		if (posX2Field != null) savedX2 = posX2Field.getValue();
+		if (posY2Field != null) savedY2 = posY2Field.getValue();
+		if (posZ2Field != null) savedZ2 = posZ2Field.getValue();
+		savedAutoSize = autoSize;
+		savedPlan = currentPlan;
+		savedSpec = currentSpec;
+		savedOrigin = currentOrigin;
+		savedBound = currentBound;
+		savedStatus = status;
 	}
 
 	@Override
 	public void onClose() {
+		saveState();
 		if (pendingTask != null) {
 			pendingTask.cancel(true);
 		}
