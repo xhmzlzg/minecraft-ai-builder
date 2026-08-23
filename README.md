@@ -16,15 +16,15 @@
 
 | 依赖 | 版本 |
 | --- | --- |
-| Minecraft | 26.1.2 |
+| Minecraft | 26.1.2 / 26.2（同一个 jar 双版本通用） |
 | Fabric Loader | >= 0.19.0 |
-| Fabric API | 0.155.2+26.1.2 |
+| Fabric API | 对应版本 Fabric API |
 | Java | >= 24 |
 
 ## 安装方法
 
-1. 安装 [Fabric Loader](https://fabricmc.net/use/) 与 Minecraft 26.1.2
-2. 将 `fabric-api` 与 `minecraft-ai-1.0.0.jar` 放入 `.minecraft/versions/<版本>/mods/` 目录
+1. 安装 [Fabric Loader](https://fabricmc.net/use/) 与 Minecraft 26.1.2 或 26.2
+2. 将对应版本的 `fabric-api` 与 `minecraft-ai-1.0.1.jar` 放入 `.minecraft/versions/<版本>/mods/` 目录
 3. 启动游戏
 
 ## 使用方法

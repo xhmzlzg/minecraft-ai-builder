@@ -51,6 +51,7 @@ public class BuildingExecutor {
 
 	/**
 	 * 在服务端线程中执行撤销，返回是否撤销成功。
+	 * 从上至下逆序恢复方块，并彻底清除任何产生的掉落物实体。
 	 */
 	public static CompletableFuture<Boolean> undo(MinecraftServer server) {
 		if (server == null) {
@@ -65,10 +66,33 @@ public class BuildingExecutor {
 			if (world == null) {
 				return false;
 			}
-			for (int i = 0; i < data.positions.size(); i++) {
-				world.setBlock(data.positions.get(i), data.oldStates.get(i), 3);
+			int minX = Integer.MAX_VALUE, maxX = Integer.MIN_VALUE;
+			int minY = Integer.MAX_VALUE, maxY = Integer.MIN_VALUE;
+			int minZ = Integer.MAX_VALUE, maxZ = Integer.MIN_VALUE;
+
+			// 从上往下逆序撤销（防止支撑方块先被移除导致上方门/床/灯笼掉落）
+			for (int i = data.positions.size() - 1; i >= 0; i--) {
+				BlockPos pos = data.positions.get(i);
+				minX = Math.min(minX, pos.getX());
+				maxX = Math.max(maxX, pos.getX());
+				minY = Math.min(minY, pos.getY());
+				maxY = Math.max(maxY, pos.getY());
+				minZ = Math.min(minZ, pos.getZ());
+				maxZ = Math.max(maxZ, pos.getZ());
+
+				// 静默恢复原状态（无掉落）
+				world.setBlock(pos, data.oldStates.get(i), Block.UPDATE_CLIENTS | Block.UPDATE_KNOWN_SHAPE);
 			}
-			MinecraftAIMod.LOGGER.info("[Minecraft AI] 已撤销上次建造 ({} 个方块)", data.positions.size());
+
+			// 清除该区域内可能产生的所有掉落物
+			if (minX <= maxX) {
+				net.minecraft.world.phys.AABB box = new net.minecraft.world.phys.AABB(
+						minX - 2, minY - 2, minZ - 2, maxX + 3, maxY + 3, maxZ + 3);
+				world.getEntitiesOfClass(net.minecraft.world.entity.item.ItemEntity.class, box)
+						.forEach(net.minecraft.world.entity.Entity::discard);
+			}
+
+			MinecraftAIMod.LOGGER.info("[Minecraft AI] 已撤销上次建造 ({} 个方块，无掉落物)", data.positions.size());
 			return true;
 		});
 	}
@@ -132,6 +156,16 @@ public class BuildingExecutor {
 			positions.add(pos);
 			placed++;
 		}
+
+		// 第二阶段：更新所有相连方块（如玻璃板、栏杆、栅栏、台阶、墙等）的形貌連接
+		for (BlockPos pos : positions) {
+			BlockState current = world.getBlockState(pos);
+			BlockState updated = Block.updateFromNeighbourShapes(current, world, pos);
+			if (updated != current) {
+				world.setBlock(pos, updated, 3);
+			}
+		}
+
 		if (!positions.isEmpty()) {
 			undoStack.add(new UndoData(world.dimension(), origin, positions, oldStates));
 		}

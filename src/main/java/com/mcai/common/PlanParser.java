@@ -228,30 +228,36 @@ public class PlanParser {
 		for (int k = 0; k < raws.size(); k++) {
 			List<String> rows = raws.get(k);
 			List<String> norm = new ArrayList<>();
+			char[][] grid = new char[maxD][targetW];
 			for (int z = 0; z < maxD; z++) {
 				String src = (rows != null && z < rows.size()) ? rows.get(z) : "";
-				// 去掉 AI 常加的格间空格（"# . W ." -> "#.W."）
 				String cleaned = src.replace(" ", "").replace("\t", "");
-				StringBuilder sb = new StringBuilder();
 				for (int x = 0; x < targetW; x++) {
 					char c = x < cleaned.length() ? cleaned.charAt(x) : '#';
+					grid[z][x] = c;
+				}
+			}
+
+			// 外墙闭合保护：仅当边缘是室内家具或杂物时才补外墙 '#'，防止室内家具悬空暴露；
+			// 完整保留边缘的门 'D'、窗 'W'、柱 'P' 与开放通道/阳台/门廊 '.'，杜绝封死大门与门前通道！
+			for (int z = 0; z < maxD; z++) {
+				for (int x = 0; x < targetW; x++) {
+					char c = grid[z][x];
 					if (x == 0 || x == targetW - 1 || z == 0 || z == maxD - 1) {
-						if (!isOpening(c)) {
-							c = '#';
+						if (c == 'R' || c == 'B' || c == 'C' || c == 'F' || c == 'K' || c == 'H'
+								|| c == 'M' || c == 'Y' || c == 'L' || c == 'T' || c == 'X') {
+							grid[z][x] = '#';
 						}
 					}
-					sb.append(c);
 				}
-				norm.add(sb.toString());
+			}
+
+			for (int z = 0; z < maxD; z++) {
+				norm.add(new String(grid[z]));
 			}
 			boolean isTop = k == raws.size() - 1;
 			out.add(new Blueprint(norm, isTop ? ceiling : null));
 		}
 		return out;
-	}
-
-	/** 允许出现在外墙边缘的字符（门窗柱开口） */
-	private static boolean isOpening(char c) {
-		return c == '#' || c == 'W' || c == 'D' || c == 'P';
 	}
 }

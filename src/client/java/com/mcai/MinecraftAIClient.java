@@ -29,7 +29,7 @@ public class MinecraftAIClient implements ClientModInitializer {
 
 		ClientTickEvents.END_CLIENT_TICK.register(client -> {
 			if (openScreenKey.consumeClick() && client.player != null) {
-				client.setScreen(new AiBuildScreen(CONFIG));
+				com.mcai.client.gui.ScreenCompat.setScreen(client, new AiBuildScreen(CONFIG));
 			}
 		});
 	}
