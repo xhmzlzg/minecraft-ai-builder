@@ -94,15 +94,15 @@ public class BuildingExecutor {
 				}
 			}
 			boolean upperDoor = e.blockId().endsWith("_upper");
-			boolean bedFoot = e.blockId().endsWith("_bed_foot");
-			boolean bedHead = e.blockId().endsWith("_bed_head");
+			boolean bedFoot = e.blockId().endsWith("_foot");
+			boolean bedHead = e.blockId().endsWith("_head");
 			String baseId = e.blockId();
 			if (upperDoor) {
 				baseId = baseId.substring(0, baseId.length() - "_upper".length());
 			} else if (bedFoot) {
-				baseId = baseId.substring(0, baseId.length() - "_bed_foot".length());
+				baseId = baseId.substring(0, baseId.length() - "_foot".length());
 			} else if (bedHead) {
-				baseId = baseId.substring(0, baseId.length() - "_bed_head".length());
+				baseId = baseId.substring(0, baseId.length() - "_head".length());
 			}
 			Block block = resolveBlock(baseId);
 			if (block == Blocks.AIR) {

@@ -62,30 +62,36 @@ public class AiConfigScreen extends Screen {
 		addRenderableWidget(thinkingButton);
 
 		int fieldY = y0 + 52;
-		int fieldW = PANEL_W - 20;
-		baseUrlField = new EditBox(this.font, x0 + 10, fieldY, fieldW, 18, Component.literal("API地址"));
+		int labelW = 76;
+		int fieldW = PANEL_W - 20 - labelW;
+		baseUrlField = new EditBox(this.font, x0 + 10 + labelW, fieldY, fieldW, 18, Component.literal("Base URL"));
 		baseUrlField.setValue(config.openaiBaseUrl);
-		baseUrlField.setHint(Component.literal("API 地址（OpenAI 兼容，以 /v1 结尾，如 https://api.deepseek.com/v1）"));
+		baseUrlField.setMaxLength(10000);
+		baseUrlField.setHint(Component.literal("以 /v1 结尾，如 https://api.deepseek.com/v1"));
 		addRenderableWidget(baseUrlField);
 
-		modelField = new EditBox(this.font, x0 + 10, fieldY + 20, fieldW, 18, Component.literal("模型名"));
+		modelField = new EditBox(this.font, x0 + 10 + labelW, fieldY + 20, fieldW, 18, Component.literal("模型名"));
 		modelField.setValue(config.openaiModel);
-		modelField.setHint(Component.literal("模型名（如 mimo-v2.5、mimo-v2.5-pro、deepseek-chat）"));
+		modelField.setMaxLength(10000);
+		modelField.setHint(Component.literal("如 mimo-v2.5、deepseek-chat"));
 		addRenderableWidget(modelField);
 
-		apiKeyField = new EditBox(this.font, x0 + 10, fieldY + 40, fieldW, 18, Component.literal("API Key"));
+		apiKeyField = new EditBox(this.font, x0 + 10 + labelW, fieldY + 40, fieldW, 18, Component.literal("API Key"));
 		apiKeyField.setValue(config.openaiApiKey);
-		apiKeyField.setHint(Component.literal("API Key（sk-xxx，仅保存在本地配置文件）"));
+		apiKeyField.setMaxLength(10000);
+		apiKeyField.setHint(Component.literal("sk-xxx，仅保存在本地配置文件"));
 		addRenderableWidget(apiKeyField);
 
-		ollamaUrlField = new EditBox(this.font, x0 + 10, fieldY + 60, fieldW, 18, Component.literal("Ollama地址"));
+		ollamaUrlField = new EditBox(this.font, x0 + 10 + labelW, fieldY + 60, fieldW, 18, Component.literal("Ollama 地址"));
 		ollamaUrlField.setValue(config.ollamaUrl);
-		ollamaUrlField.setHint(Component.literal("Ollama 地址（选择本地 Ollama 后端时使用）"));
+		ollamaUrlField.setMaxLength(10000);
+		ollamaUrlField.setHint(Component.literal("选择本地 Ollama 后端时使用"));
 		addRenderableWidget(ollamaUrlField);
 
-		ollamaModelField = new EditBox(this.font, x0 + 10, fieldY + 80, fieldW, 18, Component.literal("Ollama模型"));
+		ollamaModelField = new EditBox(this.font, x0 + 10 + labelW, fieldY + 80, fieldW, 18, Component.literal("Ollama 模型"));
 		ollamaModelField.setValue(config.ollamaModel);
-		ollamaModelField.setHint(Component.literal("Ollama 模型名（选择本地 Ollama 后端时使用）"));
+		ollamaModelField.setMaxLength(10000);
+		ollamaModelField.setHint(Component.literal("选择本地 Ollama 后端时使用"));
 		addRenderableWidget(ollamaModelField);
 
 		Button saveButton = Button.builder(Component.literal("保存"),
@@ -143,6 +149,12 @@ public class AiConfigScreen extends Screen {
 		super.extractRenderState(context, mouseX, mouseY, delta);
 
 		context.centeredText(this.font, "AI 配置", cx, y0 + 4, 0xFFFFFFFF);
+		int fieldY = y0 + 52;
+		context.text(this.font, "Base URL：", x0 + 12, fieldY + 3, 0xFFC0C0C0);
+		context.text(this.font, "模型名：", x0 + 12, fieldY + 23, 0xFFC0C0C0);
+		context.text(this.font, "API Key：", x0 + 12, fieldY + 43, 0xFFC0C0C0);
+		context.text(this.font, "Ollama 地址：", x0 + 12, fieldY + 63, 0xFFC0C0C0);
+		context.text(this.font, "Ollama 模型：", x0 + 12, fieldY + 83, 0xFFC0C0C0);
 		String info = "当前生效：" + (useOllama ? config.ollamaModel : config.openaiModel)
 				+ "（思考" + (thinkingEnabled ? "开" : "关") + "）";
 		context.text(this.font, info, x0 + 12, y0 + 156, 0xFFC0C0C0);

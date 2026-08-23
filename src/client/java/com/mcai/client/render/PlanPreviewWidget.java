@@ -98,7 +98,7 @@ public class PlanPreviewWidget {
 		double projectedW = (w + d) * tw / 2.0;
 		double projectedH = (w + d) * tw / 4.0 + (h + 1) * tw * 0.8;
 		double scale = Math.min(1.0, Math.min(viewWidth / projectedW, viewHeight / projectedH));
-		tw = Math.max(3, tw * scale);
+		tw = Math.max(1.0, tw * scale);
 
 		int cx = centerX;
 		int cy = centerY;
@@ -116,7 +116,7 @@ public class PlanPreviewWidget {
 
 		// 方块过多时均匀抽稀，保证预览流畅（大建筑细节靠轮廓保留）
 		int total = sorted.size();
-		int maxRender = 6000;
+		int maxRender = 12000;
 		int stride = total <= maxRender ? 1 : (int) Math.ceil((double) total / maxRender);
 		for (int i = 0; i < total; i += stride) {
 			BuildingPlan.Entry e = sorted.get(i);
