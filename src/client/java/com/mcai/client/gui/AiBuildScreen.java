@@ -6,6 +6,7 @@ import java.util.concurrent.CompletableFuture;
 
 import com.mcai.MinecraftAIMod;
 import com.mcai.client.ai.AiClient;
+import com.mcai.client.ai.BuildTaskManager;
 import com.mcai.client.render.PlanPreviewWidget;
 import com.mcai.common.AiConfig;
 import com.mcai.common.BuildingExecutor;
@@ -40,6 +41,7 @@ public class AiBuildScreen extends Screen {
 	private EditBox posY2Field;
 	private EditBox posZ2Field;
 	private Button generateButton;
+	private Button adjustButton;
 	private Button buildButton;
 	private Button undoButton;
 
@@ -48,18 +50,29 @@ public class AiBuildScreen extends Screen {
 	private BuildingPlan currentPlan;
 	private BlockPos currentOrigin;
 	private BlockPos currentBound;
-	private CompletableFuture<String> pendingTask;
 	private PreeditEvent lastPreedit;
-	private long requestStartMs;
+	private BuildTaskManager.Phase lastPhase;
+	/** 调整流程状态：0=普通模式，1=已载入上次方案等待输入意见 */
+	private int adjustStage = 0;
+	/** 打开时是否直接展示上一次的生成结果（点击悬浮球进入时为 true） */
+	private final boolean showResult;
 	private static final int STATUS_LINES = 3;
 	private static final int STATUS_LINE_H = 14;
 	private String lastStatus;
 	private List<String> statusLines = List.of();
 	private int statusScroll = 0;
+	private boolean previewDragging = false;
+	private boolean rotatePressed = false;
+	private boolean rotateDragging = false;
 
 	public AiBuildScreen(AiConfig config) {
+		this(config, false);
+	}
+
+	public AiBuildScreen(AiConfig config, boolean showResult) {
 		super(Component.literal("AI 建造助手"));
 		this.config = config;
+		this.showResult = showResult;
 		this.status = "输入建筑描述，点击「生成方案」（当前模型：" + config.modelName() + "）";
 	}
 
@@ -123,15 +136,19 @@ public class AiBuildScreen extends Screen {
 
 		generateButton = Button.builder(Component.literal("生成方案"),
 				b -> requestPlan())
-				.bounds(x0 + 10, y0 + PANEL_H - 26, 80, 20)
+				.bounds(x0 + 10, y0 + PANEL_H - 26, 68, 20)
+				.build();
+		adjustButton = Button.builder(Component.literal("按意见调整"),
+				b -> adjustPlan())
+				.bounds(x0 + 82, y0 + PANEL_H - 26, 68, 20)
 				.build();
 		buildButton = Button.builder(Component.literal("确认建造"),
 				b -> executeBuild())
-				.bounds(x0 + 100, y0 + PANEL_H - 26, 80, 20)
+				.bounds(x0 + 154, y0 + PANEL_H - 26, 68, 20)
 				.build();
 		undoButton = Button.builder(Component.literal("撤销上次"),
 				b -> undoBuild())
-				.bounds(x0 + 190, y0 + PANEL_H - 26, 80, 20)
+				.bounds(x0 + 226, y0 + PANEL_H - 26, 68, 20)
 				.build();
 		Button configButton = Button.builder(Component.literal("设置"),
 				b -> {
@@ -139,12 +156,45 @@ public class AiBuildScreen extends Screen {
 						this.minecraft.setScreen(new AiConfigScreen(config));
 					}
 				})
-				.bounds(x0 + 290, y0 + PANEL_H - 26, 80, 20)
+				.bounds(x0 + 298, y0 + PANEL_H - 26, 68, 20)
 				.build();
 		addRenderableWidget(generateButton);
+		addRenderableWidget(adjustButton);
 		addRenderableWidget(buildButton);
 		addRenderableWidget(undoButton);
 		addRenderableWidget(configButton);
+
+		// 从全局任务管理器恢复：默认干净界面；生成中显示进度；
+		// 点悬浮球进入(showResult)或有未查看的新结果(按K)时展示上次结果
+		BuildTaskManager m = BuildTaskManager.INSTANCE;
+		if (m.isGenerating()) {
+			status = "AI 设计中…（已等待 " + m.elapsedSeconds() + " 秒，AI 正在画楼层蓝图）。可按 ESC 关闭面板，生成不会中断";
+		} else if ((showResult || m.hasFreshResult()) && m.plan() != null) {
+			currentPlan = m.plan();
+			currentOrigin = m.origin() != null ? m.origin() : currentOrigin;
+			currentBound = m.bound() != null ? m.bound() : currentBound;
+			preview.setPlan(currentPlan);
+			if (currentOrigin != null) {
+				posXField.setValue(String.valueOf(currentOrigin.getX()));
+				posYField.setValue(String.valueOf(currentOrigin.getY()));
+				posZField.setValue(String.valueOf(currentOrigin.getZ()));
+			}
+			if (currentBound != null) {
+				posX2Field.setValue(String.valueOf(currentBound.getX()));
+				posY2Field.setValue(String.valueOf(currentBound.getY()));
+				posZ2Field.setValue(String.valueOf(currentBound.getZ()));
+			}
+			status = "方案「" + currentPlan.name + "」" + (m.isAdjusted() ? "已按意见调整" : "已生成")
+					+ "：" + currentPlan.width + "x" + currentPlan.height + "x" + currentPlan.depth
+					+ "，共 " + currentPlan.size() + " 个方块。确认后建造于 "
+					+ (currentOrigin == null ? "-" : currentOrigin.getX() + ", " + currentOrigin.getY() + ", " + currentOrigin.getZ());
+			m.acknowledge();
+		} else if (m.phase() == BuildTaskManager.Phase.FAILED) {
+			status = "出错：" + m.errorMsg() + "（可重试）";
+			m.acknowledge();
+		}
+		lastPhase = m.phase();
+		updateButtons();
 	}
 
 	private BlockPos defaultOrigin() {
@@ -160,24 +210,10 @@ public class AiBuildScreen extends Screen {
 		return new BlockPos(0, 64, 0);
 	}
 
-	/** 从玩家描述提取明确楼层数（如"20 层"、"至少 15 层"、"层数 8"）；没有则 null */
-	private static Integer extractFloorHint(String description) {
-		if (description == null) {
-			return null;
-		}
-		java.util.regex.Matcher m = java.util.regex.Pattern
-				.compile("(\\d+)\\s*(?:楼)?层|层(?:数)?\\s*(?:为|=)?\\s*(\\d+)").matcher(description);
-		if (m.find()) {
-			String v = m.group(1) != null ? m.group(1) : m.group(2);
-			if (v != null) {
-				return Integer.parseInt(v);
-			}
-		}
-		return null;
-	}
+	/** 从玩家描述提取明确楼层数的逻辑已移至 BuildTaskManager */
 
 	private void requestPlan() {
-		if (busy) {
+		if (BuildTaskManager.INSTANCE.isGenerating() || busy) {
 			return;
 		}
 		String desc = descField.getValue().trim();
@@ -201,12 +237,12 @@ public class AiBuildScreen extends Screen {
 			bound = hi;
 		}
 
-		busy = true;
-		updateButtons();
 		currentOrigin = origin;
 		currentBound = bound;
-		requestStartMs = System.currentTimeMillis();
+		adjustStage = 0;
+		adjustButton.setMessage(Component.literal("调整上次方案"));
 		status = "AI 设计中…（约 10~90 秒，AI 正在画楼层蓝图）";
+		lastPhase = BuildTaskManager.Phase.GENERATING;
 
 		String posText = origin.getX() + " " + origin.getY() + " " + origin.getZ();
 		if (bound != null) {
@@ -217,30 +253,74 @@ public class AiBuildScreen extends Screen {
 					+ ") 到 (" + bound.getX() + " " + bound.getY() + " " + bound.getZ()
 					+ ")（宽 " + w + " 深 " + d + " 高 " + h + "），建筑要尽量填满这个空间，但绝不能超出它的范围";
 		}
-		pendingTask = AiClient.askPlan(desc, posText, config);
-		pendingTask.whenComplete((reply, error) -> {
-			if (this.minecraft == null) {
+		BuildTaskManager.INSTANCE.start(this.minecraft, desc, posText, origin, bound);
+		updateButtons();
+	}
+
+	/** 按意见调整：第一次点击载入上次方案（坐标/预览），第二次点击（按钮变「确认调整」）发起调整 */
+	private void adjustPlan() {
+		BuildTaskManager m = BuildTaskManager.INSTANCE;
+		if (m.isGenerating() || busy) {
+			return;
+		}
+		if (adjustStage == 0) {
+			if (m.plan() == null) {
+				status = "还没有可调整的方案，请先用「生成方案」创建";
 				return;
 			}
-			this.minecraft.execute(() -> {
-				busy = false;
-				pendingTask = null;
-				if (error != null) {
-					status = "出错：" + rootMessage(error);
-					updateButtons();
-					return;
-				}
-try {
-					PlanSpec spec = PlanParser.parse(reply);
-					PlanParser.applyFloorHint(spec, extractFloorHint(desc));
-					MinecraftAIMod.LOGGER.info("[Minecraft AI] AI 回复: {}", reply);
-					MinecraftAIMod.LOGGER.info("[Minecraft AI] 解析方案: name={} floors={} wall={} accent={} roof={} interiors={} repeat={} maps={}",
-							spec.name, spec.floors, spec.wall, spec.accent, spec.roof, spec.interiors, spec.repeat,
-							spec.floorsMap == null ? 0 : spec.floorsMap.size());
-					currentPlan = PlanGenerator.generate(spec, desc);
+			adjustStage = 1;
+			currentPlan = m.plan();
+			currentOrigin = m.origin() != null ? m.origin() : currentOrigin;
+			currentBound = m.bound() != null ? m.bound() : currentBound;
+			preview.setPlan(currentPlan);
+			if (currentOrigin != null) {
+				posXField.setValue(String.valueOf(currentOrigin.getX()));
+				posYField.setValue(String.valueOf(currentOrigin.getY()));
+				posZField.setValue(String.valueOf(currentOrigin.getZ()));
+			}
+			if (currentBound != null) {
+				posX2Field.setValue(String.valueOf(currentBound.getX()));
+				posY2Field.setValue(String.valueOf(currentBound.getY()));
+				posZ2Field.setValue(String.valueOf(currentBound.getZ()));
+			} else {
+				posX2Field.setValue("");
+				posY2Field.setValue("");
+				posZ2Field.setValue("");
+			}
+			status = "已载入上次方案「" + currentPlan.name + "」。请在输入框输入要调整的内容，再点「确认调整」";
+			adjustButton.setMessage(Component.literal("确认调整"));
+			return;
+		}
+		String opinion = descField.getValue().trim();
+		if (opinion.isEmpty()) {
+			status = "请先在输入框输入要调整的内容（如：三层改成露台，窗户多一倍）";
+			return;
+		}
+		adjustStage = 0;
+		adjustButton.setMessage(Component.literal("调整上次方案"));
+		status = "正在按意见调整方案…（约 10~90 秒）";
+		lastPhase = BuildTaskManager.Phase.GENERATING;
+		m.adjust(this.minecraft, opinion);
+		updateButtons();
+	}
+
+	/** 每帧同步全局任务状态（生成完成/失败时更新界面） */
+	private void syncManagerState() {
+		BuildTaskManager m = BuildTaskManager.INSTANCE;
+		BuildTaskManager.Phase p = m.phase();
+		if (p != lastPhase) {
+			lastPhase = p;
+			switch (p) {
+				case SUCCESS -> {
+					adjustStage = 0;
+					adjustButton.setMessage(Component.literal("调整上次方案"));
+					currentPlan = m.plan();
+					currentOrigin = m.origin() != null ? m.origin() : currentOrigin;
+					currentBound = m.bound() != null ? m.bound() : currentBound;
 					preview.setPlan(currentPlan);
-					status = "方案「" + currentPlan.name + "」已生成：" + currentPlan.width + "x" + currentPlan.height
-							+ "x" + currentPlan.depth + "，共 " + currentPlan.size() + " 个方块。确认后建造于 "
+					status = "方案「" + currentPlan.name + "」" + (m.isAdjusted() ? "已按意见调整" : "已生成")
+							+ "：" + currentPlan.width + "x" + currentPlan.height + "x" + currentPlan.depth
+							+ "，共 " + currentPlan.size() + " 个方块。确认后建造于 "
 							+ currentOrigin.getX() + ", " + currentOrigin.getY() + ", " + currentOrigin.getZ();
 					if (currentBound != null) {
 						String over = overBoundText(currentPlan, currentOrigin, currentBound);
@@ -248,13 +328,17 @@ try {
 							status += "。" + over + "（确认建造将按完整方案放置，不做裁剪）";
 						}
 					}
-				} catch (IllegalArgumentException e) {
-					status = "AI 方案解析失败：" + e.getMessage() + "（可点「生成方案」重试）";
+					m.acknowledge();
 				}
-				updateButtons();
-			});
-		});
-		updateButtons();
+				case FAILED -> {
+					status = "出错：" + m.errorMsg() + "（可重试）";
+					m.acknowledge();
+				}
+				default -> {
+				}
+			}
+			updateButtons();
+		}
 	}
 
 	private void executeBuild() {
@@ -265,35 +349,49 @@ try {
 			status = "仅支持单人游戏！多人服务器需要服务器端支持";
 			return;
 		}
-		try {
-			var server = this.minecraft.getSingleplayerServer();
-			var world = server.getLevel(this.minecraft.level.dimension());
-			if (world == null) {
-				status = "建造失败：找不到当前维度";
-				return;
-			}
-			busy = true;
-			updateButtons();
-			status = "正在建造「" + currentPlan.name + "」…";
-			// 用户确认建造 = 接受可能超出空间，按 AI 完整方案放置，不做裁剪
-			var future = BuildingExecutor.execute(server, world, currentOrigin, currentPlan, null);
-			future.whenComplete((placed, error) -> {
+		var server = this.minecraft.getSingleplayerServer();
+		var world = server.getLevel(this.minecraft.level.dimension());
+		if (world == null) {
+			status = "建造失败：找不到当前维度";
+			return;
+		}
+		// 调整后的方案 + 有已建造记录 = 替换：先自动撤销旧建筑再建新的
+		boolean replacing = BuildTaskManager.INSTANCE.isAdjusted() && BuildingExecutor.canUndo();
+		busy = true;
+		updateButtons();
+		if (replacing) {
+			status = "正在替换原建筑…（先撤销旧建筑）";
+			BuildingExecutor.undo(server).whenComplete((ok, error) -> {
 				if (this.minecraft == null) {
 					return;
 				}
-				this.minecraft.execute(() -> {
-					busy = false;
-					if (error != null) {
-						status = "建造失败：" + rootMessage(error);
-					} else {
-						status = "建造完成！共放置 " + placed + " 个方块，可点「撤销上次」恢复";
-					}
-					updateButtons();
-				});
+				this.minecraft.execute(() -> startBuild(server, world));
 			});
-		} catch (Exception e) {
-			status = "建造失败：" + e.getMessage();
+		} else {
+			startBuild(server, world);
 		}
+	}
+
+	private void startBuild(net.minecraft.server.MinecraftServer server, net.minecraft.server.level.ServerLevel world) {
+		status = "正在建造「" + currentPlan.name + "」…";
+		// 用户确认建造 = 接受可能超出空间，按 AI 完整方案放置，不做裁剪
+		var future = BuildingExecutor.execute(server, world, currentOrigin, currentPlan, null);
+		future.whenComplete((placed, error) -> {
+			if (this.minecraft == null) {
+				return;
+			}
+			this.minecraft.execute(() -> {
+				busy = false;
+				if (error != null) {
+					status = "建造失败：" + rootMessage(error);
+				} else {
+					status = "建造完成！共放置 " + placed + " 个方块，可点「撤销上次」恢复";
+					// 已确认生成，右上角悬浮球消失，下次生成时才再次出现
+					BuildTaskManager.INSTANCE.acknowledge();
+				}
+				updateButtons();
+			});
+		});
 	}
 
 	private void undoBuild() {
@@ -381,8 +479,12 @@ try {
 	}
 
 	private void updateButtons() {
-		generateButton.active = !busy;
-		buildButton.active = currentPlan != null && !busy;
+		boolean generating = BuildTaskManager.INSTANCE.isGenerating();
+		// 调整按钮基于全局保存的上次方案（干净界面下也可载入调整）
+		boolean hasLastPlan = BuildTaskManager.INSTANCE.plan() != null;
+		generateButton.active = !generating && !busy;
+		adjustButton.active = hasLastPlan && !generating && !busy;
+		buildButton.active = currentPlan != null && !generating && !busy;
 		undoButton.active = BuildingExecutor.canUndo();
 	}
 
@@ -396,6 +498,7 @@ try {
 
 	@Override
 	public void extractRenderState(GuiGraphicsExtractor context, int mouseX, int mouseY, float delta) {
+		syncManagerState();
 		int cx = this.width / 2;
 		int cy = this.height / 2;
 		int x0 = cx - PANEL_W / 2;
@@ -413,7 +516,7 @@ try {
 		context.centeredText(this.font, "AI 建造助手", cx, y0 + 4, 0xFFFFFFFF);
 		context.text(this.font, "起点：", x0 + 10, y0 + 57, 0xFFE0E0E0);
 		context.text(this.font, "终点：", x0 + 10, y0 + 77, 0xFFE0E0E0);
-		context.centeredText(this.font, "3D 预览", cx, y0 + 100, 0xFFC0C0C0);
+		context.centeredText(this.font, "3D 预览（滚轮缩放 · 右键拖拽旋转 · 左键拖拽平移 · 双击复位）", cx, y0 + 100, 0xFFC0C0C0);
 
 		preview.setViewport(x0 + PANEL_W / 2, y0 + 131, PANEL_W - 16, 56);
 		preview.render(context);
@@ -481,15 +584,70 @@ try {
 		return lines;
 	}
 
-	/** 鼠标滚轮：状态文本超过 3 行时滚动查看（向上滚看更早的内容） */
+	/** 鼠标滚轮：预览区内缩放 3D 预览；预览区外滚动状态文本（向上滚看更早的内容） */
 	@Override
 	public boolean mouseScrolled(double mouseX, double mouseY, double horizontalAmount, double verticalAmount) {
+		if (preview.hasPlan() && preview.contains(mouseX, mouseY)) {
+			preview.zoom(verticalAmount);
+			return true;
+		}
 		int maxScroll = Math.max(0, statusLines.size() - STATUS_LINES);
 		if (maxScroll > 0) {
 			statusScroll = Math.max(0, Math.min(statusScroll + (int) verticalAmount, maxScroll));
 			return true;
 		}
 		return super.mouseScrolled(mouseX, mouseY, horizontalAmount, verticalAmount);
+	}
+
+	/** 预览区内：右键拖拽无级旋转（右键单击 = 旋转 90°），双击复位，左键拖拽平移 */
+	@Override
+	public boolean mouseClicked(net.minecraft.client.input.MouseButtonEvent event, boolean doubleClick) {
+		if (preview.hasPlan() && preview.contains(event.x(), event.y())) {
+			if (event.button() == 1) {
+				rotatePressed = true;
+				rotateDragging = false;
+				return true;
+			}
+			if (doubleClick) {
+				preview.resetView();
+				return true;
+			}
+			if (event.button() == 0) {
+				previewDragging = true;
+				return true;
+			}
+		}
+		return super.mouseClicked(event, doubleClick);
+	}
+
+	@Override
+	public boolean mouseDragged(net.minecraft.client.input.MouseButtonEvent event, double dragX, double dragY) {
+		if (rotatePressed && event.button() == 1) {
+			// 位移超过阈值才算拖拽旋转，否则松开时按 90° 步进处理
+			if (Math.abs(dragX) + Math.abs(dragY) > 0.5) {
+				rotateDragging = true;
+			}
+			if (rotateDragging) {
+				preview.rotateBy(dragX * 0.012, dragY * 0.012);
+			}
+			return true;
+		}
+		if (previewDragging) {
+			preview.pan(dragX, dragY);
+			return true;
+		}
+		return super.mouseDragged(event, dragX, dragY);
+	}
+
+	@Override
+	public boolean mouseReleased(net.minecraft.client.input.MouseButtonEvent event) {
+		if (rotatePressed && event.button() == 1 && !rotateDragging) {
+			preview.rotateCw();
+		}
+		rotatePressed = false;
+		rotateDragging = false;
+		previewDragging = false;
+		return super.mouseReleased(event);
 	}
 
 	private int statusColor() {
@@ -547,17 +705,15 @@ try {
 	@Override
 	public void tick() {
 		super.tick();
-		if (busy && pendingTask != null && !pendingTask.isDone()) {
-			long s = (System.currentTimeMillis() - requestStartMs) / 1000;
-			status = "AI 设计中…（已等待 " + s + " 秒，AI 正在画楼层蓝图）";
+		if (BuildTaskManager.INSTANCE.isGenerating()) {
+			long s = BuildTaskManager.INSTANCE.elapsedSeconds();
+			status = "AI 设计中…（已等待 " + s + " 秒，AI 正在画楼层蓝图）。可按 ESC 关闭面板，生成不会中断";
 		}
 	}
 
 	@Override
 	public void onClose() {
-		if (pendingTask != null) {
-			pendingTask.cancel(true);
-		}
+		// 生成任务在全局管理器中继续执行，关闭面板不中断；重开面板自动恢复进度与结果
 		super.onClose();
 	}
 }

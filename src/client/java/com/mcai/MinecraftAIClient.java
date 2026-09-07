@@ -1,15 +1,17 @@
 package com.mcai;
 
+import com.mcai.client.ai.BuildTaskManager;
+import com.mcai.client.gui.AiBuildScreen;
+import com.mcai.common.AiConfig;
 import com.mojang.blaze3d.platform.InputConstants;
 import net.fabricmc.api.ClientModInitializer;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
+import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.KeyMapping;
+import net.minecraft.resources.Identifier;
 import org.lwjgl.glfw.GLFW;
-
-import com.mcai.client.gui.AiBuildScreen;
-import com.mcai.common.AiConfig;
 
 public class MinecraftAIClient implements ClientModInitializer {
 	public static AiConfig CONFIG;
@@ -31,6 +33,10 @@ public class MinecraftAIClient implements ClientModInitializer {
 			if (openScreenKey.consumeClick() && client.player != null) {
 				client.setScreen(new AiBuildScreen(CONFIG));
 			}
+			// 游戏内鼠标被捕获无法点击 HUD，悬浮球仅作状态提示，按 K 查看结果
 		});
+
+		HudElementRegistry.addLast(Identifier.tryParse("minecraft-ai:floating_ball"),
+				(graphics, deltaTracker) -> BuildTaskManager.renderBall(graphics));
 	}
 }

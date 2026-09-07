@@ -92,6 +92,15 @@ public class AiClient {
 	 * 异步请求 AI 生成建筑方案，返回 AI 的原始文本回复。
 	 */
 	public static CompletableFuture<String> askPlan(String description, String posText, AiConfig cfg) {
+		return askPlan(description, posText, cfg, null, null);
+	}
+
+	/**
+	 * 带对话历史的请求：previousReply 非空时为"按意见调整"模式——
+	 * 把上次的原始方案作为 assistant 消息发回，AI 在自己方案的基础上修改。
+	 */
+	public static CompletableFuture<String> askPlan(String description, String posText, AiConfig cfg,
+			String previousReply, String adjustment) {
 		return CompletableFuture.supplyAsync(() -> {
 			String endpoint = cfg.chatEndpoint();
 
@@ -116,6 +125,21 @@ public class AiClient {
 			user.addProperty("role", "user");
 			user.addProperty("content", "在坐标 " + posText + " 建造：" + description);
 			messages.add(user);
+
+			if (previousReply != null && adjustment != null) {
+				// 迭代调整：带上自己上次的方案，只改需要调整的部分
+				JsonObject assistant = new JsonObject();
+				assistant.addProperty("role", "assistant");
+				assistant.addProperty("content", previousReply);
+				messages.add(assistant);
+
+				JsonObject feedback = new JsonObject();
+				feedback.addProperty("role", "user");
+				feedback.addProperty("content", "调整意见：" + adjustment
+						+ "\n请基于你上面的方案输出修改后的完整 JSON（格式与之前完全一致，floors_map 等所有字段都要有），"
+						+ "只改需要调整的部分，其余保持原样。只输出 JSON，禁止任何其他文字，不要代码块。");
+				messages.add(feedback);
+			}
 			body.add("messages", messages);
 
 			HttpRequest.Builder rb = HttpRequest.newBuilder()
@@ -138,30 +162,62 @@ public class AiClient {
 				}
 				return extractContent(response.body(), cfg);
 			} catch (java.net.ConnectException e) {
+				MinecraftAIMod.LOGGER.error("[Minecraft AI] 连接失败", e);
 				throw new RuntimeException("无法连接 AI 服务 " + endpoint + "（请检查 Ollama 是否启动/网络）", e);
 			} catch (java.net.http.HttpTimeoutException e) {
+				MinecraftAIMod.LOGGER.error("[Minecraft AI] 响应超时", e);
 				throw new RuntimeException("AI 响应超时（免费模型高峰期较慢，可重试）", e);
 			} catch (Exception e) {
+				MinecraftAIMod.LOGGER.error("[Minecraft AI] 请求失败: {}", e.getMessage(), e);
 				throw new RuntimeException("AI 请求失败: " + e.getMessage(), e);
 			}
 		}, EXECUTOR);
 	}
 
 	private static String extractContent(String responseBody, AiConfig cfg) {
-		JsonObject json = JsonParser.parseString(responseBody).getAsJsonObject();
+		JsonObject json;
+		try {
+			json = JsonParser.parseString(responseBody).getAsJsonObject();
+		} catch (Exception e) {
+			MinecraftAIMod.LOGGER.error("[Minecraft AI] AI 响应不是有效 JSON: {}", truncate(responseBody, 500));
+			throw new RuntimeException("AI 返回的不是有效 JSON: " + truncate(responseBody, 200));
+		}
 		if ("openai".equals(cfg.provider)) {
 			JsonArray choices = json.getAsJsonArray("choices");
 			if (choices == null || choices.isEmpty()) {
+				MinecraftAIMod.LOGGER.error("[Minecraft AI] AI 响应缺少 choices: {}", truncate(responseBody, 500));
 				throw new RuntimeException("AI 返回异常: " + truncate(responseBody, 200));
 			}
 			JsonObject message = choices.get(0).getAsJsonObject().getAsJsonObject("message");
-			String content = message.get("content").getAsString();
+			if (message == null) {
+				throw new RuntimeException("AI 返回异常（缺少 message）: " + truncate(responseBody, 200));
+			}
+			String content = getNonNullString(message, "content");
+			// 思考型模型可能只输出到 reasoning 字段，content 为空时兜底取推理文本
 			if (content == null || content.isBlank()) {
-				throw new RuntimeException("AI 返回为空（免费模型可能被限流，请稍后重试）");
+				content = getNonNullString(message, "reasoning_content");
+			}
+			if (content == null || content.isBlank()) {
+				content = getNonNullString(message, "reasoning");
+			}
+			if (content == null || content.isBlank()) {
+				MinecraftAIMod.LOGGER.error("[Minecraft AI] AI 回复为空: {}", truncate(responseBody, 500));
+				throw new RuntimeException("AI 返回为空（模型可能被限流或不支持当前参数，请重试或换个模型）");
 			}
 			return content;
 		}
-		return json.getAsJsonObject("message").get("content").getAsString();
+		return getNonNullString(json.getAsJsonObject("message"), "content");
+	}
+
+	private static String getNonNullString(JsonObject obj, String key) {
+		if (obj == null || obj.get(key) == null || obj.get(key).isJsonNull()) {
+			return "";
+		}
+		try {
+			return obj.get(key).getAsString();
+		} catch (Exception e) {
+			return "";
+		}
 	}
 
 	/**

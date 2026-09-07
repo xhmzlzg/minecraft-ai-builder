@@ -10,8 +10,9 @@ import com.mcai.common.BuildingPlan;
 import net.minecraft.client.gui.GuiGraphicsExtractor;
 
 /**
- * 等轴测 3D 方块预览渲染器。
+ * 3D 方块预览渲染器：正交投影 + 任意角度旋转（偏航 yaw / 俯仰 pitch）+ 背面剔除 + 画家算法深度排序。
  * 通过 fill() 扫描线填充多边形实现，不依赖 Minecraft 的方块渲染管线，跨版本稳定。
+ * 交互：滚轮缩放、右键拖拽无级旋转（右键单击 = 旋转 90°）、左键拖拽平移、双击复位。
  */
 public class PlanPreviewWidget {
 	private static final Map<String, Integer> BLOCK_COLORS = new HashMap<>();
@@ -55,6 +56,12 @@ public class PlanPreviewWidget {
 	}
 
 	private static final double TILE_W = 14.0;
+	private static final int MAX_RENDER = 12000;
+	// 光照方向（视线空间），归一化
+	private static final double LIGHT_X = -0.35;
+	private static final double LIGHT_Y = 0.72;
+	private static final double LIGHT_Z = -0.59;
+
 	private BuildingPlan plan;
 	private int centerX;
 	private int centerY;
@@ -64,9 +71,37 @@ public class PlanPreviewWidget {
 	private int clipRight;
 	private int clipTop;
 	private int clipBottom;
+	// 视图交互状态
+	private double userScale = 1.0;
+	private int panX = 0;
+	private int panY = 0;
+	private double yaw = Math.PI / 4;
+	private double pitch = Math.toRadians(30);
+	// 变换+排序缓存：视角或方案变化时才重算
+	private BuildingPlan cachedPlan;
+	private double cachedYaw = Double.NaN;
+	private double cachedPitch = Double.NaN;
+	private List<RenderCube> cachedList;
+
+	/** 视空间中的一个方块：8 顶点（已居中+旋转）、中心深度、6 面法线（视空间）、颜色 */
+	private static class RenderCube {
+		final double[][] v;
+		final double depth;
+		final double[][] normals;
+		final int color;
+
+		RenderCube(double[][] vertices, double depth, double[][] normals, int color) {
+			this.v = vertices;
+			this.depth = depth;
+			this.normals = normals;
+			this.color = color;
+		}
+	}
 
 	public void setPlan(BuildingPlan plan) {
 		this.plan = plan;
+		this.cachedPlan = null;
+		this.cachedList = null;
 	}
 
 	public void setViewport(int centerX, int centerY, int width, int height) {
@@ -84,82 +119,150 @@ public class PlanPreviewWidget {
 		return plan != null;
 	}
 
+	/** 鼠标是否在预览区内 */
+	public boolean contains(double mx, double my) {
+		return mx >= clipLeft && mx < clipRight && my >= clipTop && my < clipBottom;
+	}
+
+	/** 滚轮缩放 */
+	public void zoom(double amount) {
+		userScale = Math.max(0.4, Math.min(10.0, userScale * (amount > 0 ? 1.25 : 0.8)));
+	}
+
+	/** 旋转 90°（右键单击） */
+	public void rotateCw() {
+		yaw += Math.PI / 2;
+	}
+
+	/** 无级旋转（右键拖拽）：dYaw 水平 / dPitch 俯仰 */
+	public void rotateBy(double dYaw, double dPitch) {
+		yaw += dYaw;
+		pitch = Math.max(-1.4, Math.min(1.4, pitch + dPitch));
+	}
+
+	/** 拖拽平移 */
+	public void pan(double dx, double dy) {
+		panX += (int) Math.round(dx);
+		panY += (int) Math.round(dy);
+	}
+
+	/** 双击复位（缩放/平移/视角归位） */
+	public void resetView() {
+		userScale = 1.0;
+		panX = 0;
+		panY = 0;
+		yaw = Math.PI / 4;
+		pitch = Math.toRadians(30);
+	}
+
 	public void render(GuiGraphicsExtractor context) {
 		if (plan == null || plan.size() == 0) {
 			return;
 		}
 
-		int w = plan.width;
-		int h = plan.height;
-		int d = plan.depth;
+		// 视角或方案变化时重算变换与排序（拖拽旋转时每帧重算，最多 12000 块，流畅）
+		if (cachedList == null || cachedPlan != plan || cachedYaw != yaw || cachedPitch != pitch) {
+			cachedPlan = plan;
+			cachedYaw = yaw;
+			cachedPitch = pitch;
+			cachedList = buildRenderList();
+		}
 
-		// 计算缩放：保证建筑整体放进视口
+		// 计算缩放：保证建筑整体放进视口（再叠加用户缩放）
 		double tw = TILE_W;
-		double projectedW = (w + d) * tw / 2.0;
-		double projectedH = (w + d) * tw / 4.0 + (h + 1) * tw * 0.8;
+		double diagonal = Math.sqrt((double) plan.width * plan.width + (double) plan.depth * plan.depth);
+		double projectedW = diagonal * tw;
+		double projectedH = diagonal * tw * 0.5 + (plan.height + 1) * tw;
 		double scale = Math.min(1.0, Math.min(viewWidth / projectedW, viewHeight / projectedH));
-		tw = Math.max(1.0, tw * scale);
+		tw = Math.max(1.0, tw * scale) * userScale;
 
-		int cx = centerX;
-		int cy = centerY;
+		int cx = centerX + panX;
+		int cy = centerY + panY;
 
-		// 画家算法：先画远（x+z 大），再画近；同列先画低层
-		List<BuildingPlan.Entry> sorted = new ArrayList<>(plan.entries);
-		sorted.sort((a, b) -> {
-			int farA = a.x() + a.z();
-			int farB = b.x() + b.z();
-			if (farA != farB) {
-				return Integer.compare(farB, farA);
-			}
-			return Integer.compare(a.y(), b.y());
-		});
-
-		// 方块过多时均匀抽稀，保证预览流畅（大建筑细节靠轮廓保留）
-		int total = sorted.size();
-		int maxRender = 12000;
-		int stride = total <= maxRender ? 1 : (int) Math.ceil((double) total / maxRender);
-		for (int i = 0; i < total; i += stride) {
-			BuildingPlan.Entry e = sorted.get(i);
-			renderBlock(context, cx, cy, tw, e.x(), e.y(), e.z(), colorOf(e.blockId()));
+		for (RenderCube cube : cachedList) {
+			drawCube(context, cube, cx, cy, tw);
 		}
 	}
 
-	private void renderBlock(GuiGraphicsExtractor context, int cx, int cy, double tw, int x, int y, int z, int baseColor) {
-		double th = tw / 2.0;
-		double bh = tw * 0.8;
+	/** 抽稀 + 坐标变换 + 深度排序 */
+	private List<RenderCube> buildRenderList() {
+		double sinY = Math.sin(yaw);
+		double cosY = Math.cos(yaw);
+		double sinP = Math.sin(pitch);
+		double cosP = Math.cos(pitch);
+		double mx = plan.width / 2.0;
+		double my = plan.height / 2.0;
+		double mz = plan.depth / 2.0;
 
-		// 顶面（亮）
-		int[][] top = new int[][] {
-			p(cx, cy, tw, th, bh, x, z, y + 1),
-			p(cx, cy, tw, th, bh, x + 1, z, y + 1),
-			p(cx, cy, tw, th, bh, x + 1, z + 1, y + 1),
-			p(cx, cy, tw, th, bh, x, z + 1, y + 1),
-		};
-		fillPolygon(context, top, lighten(baseColor, 40));
-
-		// 左面
-		int[][] left = new int[][] {
-			p(cx, cy, tw, th, bh, x, z, y),
-			p(cx, cy, tw, th, bh, x + 1, z, y),
-			p(cx, cy, tw, th, bh, x + 1, z, y + 1),
-			p(cx, cy, tw, th, bh, x, z, y + 1),
-		};
-		fillPolygon(context, left, darken(baseColor, 30));
-
-		// 右面
-		int[][] right = new int[][] {
-			p(cx, cy, tw, th, bh, x + 1, z, y),
-			p(cx, cy, tw, th, bh, x + 1, z + 1, y),
-			p(cx, cy, tw, th, bh, x + 1, z + 1, y + 1),
-			p(cx, cy, tw, th, bh, x + 1, z, y + 1),
-		};
-		fillPolygon(context, right, darken(baseColor, 60));
+		int total = plan.entries.size();
+		int stride = total <= MAX_RENDER ? 1 : (int) Math.ceil((double) total / MAX_RENDER);
+		List<RenderCube> list = new ArrayList<>(total / stride + 1);
+		for (int i = 0; i < total; i += stride) {
+			BuildingPlan.Entry e = plan.entries.get(i);
+			double[][] verts = new double[8][3];
+			int idx = 0;
+			for (int dy = 0; dy <= 1; dy++) {
+				for (int dz = 0; dz <= 1; dz++) {
+					for (int dx = 0; dx <= 1; dx++) {
+						verts[idx++] = transform(e.x() + dx - mx, e.y() + dy - my, e.z() + dz - mz, sinY, cosY, sinP, cosP);
+					}
+				}
+			}
+			// 中心深度：z'' 越大越近，排序升序（远的先画）
+			double[] center = transform(e.x() + 0.5 - mx, e.y() + 0.5 - my, e.z() + 0.5 - mz, sinY, cosY, sinP, cosP);
+			// 6 面法线（模型空间）：top/bottom/north/south/west/east
+			double[][] modelNormals = { { 0, 1, 0 }, { 0, -1, 0 }, { 0, 0, -1 }, { 0, 0, 1 }, { -1, 0, 0 }, { 1, 0, 0 } };
+			double[][] normals = new double[6][3];
+			for (int n = 0; n < 6; n++) {
+				normals[n] = transform(modelNormals[n][0], modelNormals[n][1], modelNormals[n][2], sinY, cosY, sinP, cosP);
+			}
+			list.add(new RenderCube(verts, center[2], normals, colorOf(e.blockId())));
+		}
+		list.sort((a, b) -> Double.compare(a.depth, b.depth));
+		return list;
 	}
 
-	private static int[] p(int cx, int cy, double tw, double th, double bh, int x, int z, int y) {
-		double sx = cx + (x - z) * tw / 2.0;
-		double sy = cy + (x + z) * th / 2.0 - y * bh;
-		return new int[] { (int) Math.round(sx), (int) Math.round(sy) };
+	/** 模型坐标 -> 视空间：先绕 Y 轴偏航，再绕 X 轴俯仰 */
+	private static double[] transform(double x, double y, double z, double sinY, double cosY, double sinP, double cosP) {
+		double x1 = x * cosY + z * sinY;
+		double z1 = -x * sinY + z * cosY;
+		double y2 = y * cosP - z1 * sinP;
+		double z2 = y * sinP + z1 * cosP;
+		return new double[] { x1, y2, z2 };
+	}
+
+	/** 面顶点索引（对应 buildRenderList 的顶点顺序 y,z,x 循环：idx = dy*4 + dz*2 + dx） */
+	private static final int[][] FACES = {
+			{ 4, 5, 7, 6 }, // top (y+1)
+			{ 0, 1, 3, 2 }, // bottom (y)
+			{ 0, 1, 5, 4 }, // north (z)
+			{ 2, 3, 7, 6 }, // south (z+1)
+			{ 0, 2, 6, 4 }, // west (x)
+			{ 1, 3, 7, 5 }, // east (x+1)
+	};
+
+	private void drawCube(GuiGraphicsExtractor context, RenderCube cube, int cx, int cy, double tw) {
+		for (int f = 0; f < 6; f++) {
+			double nx = cube.normals[f][0];
+			double ny = cube.normals[f][1];
+			double nz = cube.normals[f][2];
+			// 背面剔除：法线朝向相机（+z''，z'' 大 = 近）才可见
+			if (nz <= 0) {
+				continue;
+			}
+			int[] face = FACES[f];
+			int[][] pts = new int[4][2];
+			for (int i = 0; i < 4; i++) {
+				double[] v = cube.v[face[i]];
+				pts[i][0] = (int) Math.round(cx + v[0] * tw);
+				pts[i][1] = (int) Math.round(cy - v[1] * tw);
+			}
+			// 按面法线与光照夹角调明暗
+			double dot = nx * LIGHT_X + ny * LIGHT_Y + nz * LIGHT_Z;
+			int bright = (int) (90 * Math.max(0, dot));
+			int color = bright > 0 ? lighten(cube.color, bright) : darken(cube.color, -bright / 2);
+			fillPolygon(context, pts, color);
+		}
 	}
 
 	private int colorOf(String blockId) {
