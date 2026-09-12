@@ -10,6 +10,9 @@ import com.mcai.common.BuildingPlan;
 import com.mcai.common.PlanGenerator;
 import com.mcai.common.PlanParser;
 import com.mcai.common.PlanSpec;
+import com.mcai.common.spec.BuildingSpec;
+import com.mcai.common.spec.SpecBuilder;
+import com.mcai.common.spec.SpecParser;
 
 import net.minecraft.client.Minecraft;
 
@@ -102,13 +105,27 @@ public class BuildTaskManager {
 				previousReply, adjustment);
 		pending.thenAcceptAsync(reply -> {
 			try {
-				PlanSpec spec = PlanParser.parse(reply);
-				PlanParser.applyFloorHint(spec, extractFloorHint(desc));
 				MinecraftAIMod.LOGGER.info("[Minecraft AI] AI 回复: {}", reply);
-				MinecraftAIMod.LOGGER.info("[Minecraft AI] 解析方案: name={} floors={} wall={} accent={} roof={} interiors={} repeat={} maps={}",
-						spec.name, spec.floors, spec.wall, spec.accent, spec.roof, spec.interiors, spec.repeat,
-						spec.floorsMap == null ? 0 : spec.floorsMap.size());
-				plan = PlanGenerator.generate(spec, desc);
+				if (SpecParser.looksLegacy(reply)) {
+					plan = buildLegacy(reply, desc);
+				} else {
+					BuildingSpec spec = SpecParser.parse(reply);
+					if (spec == null) {
+						// 兼容：模型仍按旧契约回答（字符画蓝图）时走旧管线
+						plan = buildLegacy(reply, desc);
+					} else {
+						int[] box = boxSize();
+						SpecBuilder.Result res = SpecBuilder.build(spec, box[0], box[1], box[2]);
+						plan = res.plan;
+						MinecraftAIMod.LOGGER.info(
+								"[Minecraft AI] 规格展开: archetype={} floors={} layerHeight={} 方块数={}",
+								spec.archetype, res.floors, res.layerHeight, plan.size());
+						MinecraftAIMod.LOGGER.info("[Minecraft AI] 体检: {}", res.report.summary());
+						for (String p : res.report.problems) {
+							MinecraftAIMod.LOGGER.warn("[Minecraft AI] 遗留问题: {}", p);
+						}
+					}
+				}
 				rawReply = reply;
 				freshResult = true;
 				phase = Phase.SUCCESS;
@@ -125,6 +142,27 @@ public class BuildTaskManager {
 			phase = Phase.FAILED;
 			return null;
 		});
+	}
+
+	/** 旧契约（字符画蓝图）管线，保留兼容 */
+	private BuildingPlan buildLegacy(String reply, String desc) {
+		PlanSpec spec = PlanParser.parse(reply);
+		PlanParser.applyFloorHint(spec, extractFloorHint(desc));
+		MinecraftAIMod.LOGGER.info("[Minecraft AI] 旧契约蓝图: name={} floors={} wall={} accent={} roof={} maps={}",
+				spec.name, spec.floors, spec.wall, spec.accent, spec.roof,
+				spec.floorsMap == null ? 0 : spec.floorsMap.size());
+		return PlanGenerator.generate(spec, desc);
+	}
+
+	/** 玩家框选范围 → [宽, 进深, 高] */
+	private int[] boxSize() {
+		if (origin == null || bound == null) {
+			return new int[] { 33, 19, 64 };
+		}
+		return new int[] {
+				Math.abs(bound.getX() - origin.getX()) + 1,
+				Math.abs(bound.getZ() - origin.getZ()) + 1,
+				Math.abs(bound.getY() - origin.getY()) + 1 };
 	}
 
 	/** 结果已被查看（打开面板），悬浮球隐藏；方案数据保留供"调整上次方案"使用 */

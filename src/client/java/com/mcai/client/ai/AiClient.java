@@ -78,6 +78,54 @@ public class AiClient {
 			5. 室内房间要分隔：用 # 做内墙，分出客厅/卧室/厨房/卫生间等区域
 			""";
 
+	/**
+	 * v1.1.0 新契约：AI 输出"设计规格 JSON"（DSL），由 SpecBuilder 参数化展开成方块。
+	 * 相比旧版字符画蓝图（8~24 格、13 个字符），规格可以表达层高、户型、房间、
+	 * 材质、屋顶构件、楼梯电梯等细节，而且输出很短 —— 细节不再被输出长度挤掉。
+	 */
+	private static final String SYSTEM_PROMPT_V2 = """
+			你是 Minecraft 建筑设计师兼规格工程师。玩家描述想要的建筑，你输出【设计规格 JSON】，
+			由游戏内的参数化构件库确定性地展开成方块（门窗、家具、楼梯、电梯、屋面都由程序按规格生成）。
+
+			只输出 JSON，禁止任何解释文字，禁止代码块。
+
+			JSON 结构（除 name 外都可省略，程序会补合理默认值）：
+			{
+			  "spec_version": 2,
+			  "name": "建筑名",
+			  "archetype": "chinese_highrise|chinese_courtyard|modern_villa|castle|generic",
+			  "floors": 层数,
+			  "layer_height": 层高(3~8，住宅默认4 = 1格楼板 + 3格净高),
+			  "size": [宽, 进深],
+			  "features": ["stairs","elevator","balcony","roof_equipment","parapet","garden","no_ac"],
+			  "materials": {"wall":"方块id","accent":"方块id","glass":"方块id","frame":"方块id",
+			                "base":"方块id","floor_living":"方块id","floor_wet":"方块id","roof":"方块id"},
+			  "rooms": [{"type":"living","x":0,"z":0,"w":6,"d":5}],
+			  "roof": {"style":"flat|pyramid|gabled","parapet":true,"water_tank":true,"solar":true,"garden":false},
+			  "notes": "玩家提到的其它细节"
+			}
+
+			房间 type 只能取：living(客厅) master(主卧) bed2/bed3(次卧) kitchen(厨房) bath(卫生间)
+			dining(餐厅) entry(玄关) hall(走道) balcony(阳台) study(书房) storage(储物)
+			stairs(楼梯间) lobby(候梯厅) courtyard(庭院) pool(水池) garden(花园)
+			每个房间会自动配家具：客厅沙发电视茶几、主卧双人床+衣柜、厨房灶台抽油烟机水槽冰箱、
+			卫生间马桶洗手台淋浴、餐厅餐桌椅、玄关鞋柜、阳台晾衣杆+洗衣机、书房书桌书柜。
+
+			硬性规则：
+			1. floors 必须严格等于玩家说的层数；没说就按原型默认（中式高层8、别墅2、城堡3）。
+			2. archetype 判断：中国城市住宅楼/公寓/居民楼 → chinese_highrise；中式院落/四合院 → chinese_courtyard；
+			   别墅/现代住宅 → modern_villa；城堡/要塞 → castle；其它 → generic。
+			3. chinese_highrise 由程序自动生成"一梯两户 + 双跑楼梯 + 脚手架电梯井 + 候梯厅"，
+			   你不必也无法用房间表描述核心筒，只需让 features 含 stairs 和 elevator。
+			4. 屋顶必须封顶（程序自动铺平屋面 + 女儿墙），可用 roof.style 选 flat/pyramid/gabled。
+			5. 窗由程序按房间类型自动开（客厅卧室大窗、厨卫小高窗），不要试图自己排窗。
+			6. size 一般省略（用玩家框选的范围）；只有玩家明确要求尺寸时才填。房间表同理，只有自定义户型时才给。
+			7. materials 只填确实要指定的项，其余省略用原型默认。
+			8. notes 写玩家提到的其它细节（颜色、风格、特殊要求），程序会尽量落实。
+			9. 被要求"按意见调整"时：你会看到自己上一次的规格 JSON 和玩家的修改意见，
+			   请输出【完整的新规格 JSON】（结构完全一致），只改需要改的字段，其余原样保留。
+			""";
+
 	private static final HttpClient HTTP = HttpClient.newBuilder()
 			.connectTimeout(Duration.ofSeconds(5))
 			.build();
@@ -118,7 +166,7 @@ public class AiClient {
 			JsonArray messages = new JsonArray();
 			JsonObject system = new JsonObject();
 			system.addProperty("role", "system");
-			system.addProperty("content", SYSTEM_PROMPT);
+			system.addProperty("content", SYSTEM_PROMPT_V2);
 			messages.add(system);
 
 			JsonObject user = new JsonObject();
@@ -136,8 +184,9 @@ public class AiClient {
 				JsonObject feedback = new JsonObject();
 				feedback.addProperty("role", "user");
 				feedback.addProperty("content", "调整意见：" + adjustment
-						+ "\n请基于你上面的方案输出修改后的完整 JSON（格式与之前完全一致，floors_map 等所有字段都要有），"
-						+ "只改需要调整的部分，其余保持原样。只输出 JSON，禁止任何其他文字，不要代码块。");
+						+ "\n请基于你上面的规格输出【完整的新规格 JSON】（spec_version/archetype/floors/layer_height/"
+						+ "features/materials/roof 等字段都要有，结构完全一致），只改需要调整的字段，其余原样保留。"
+						+ "只输出 JSON，禁止任何其他文字，不要代码块。");
 				messages.add(feedback);
 			}
 			body.add("messages", messages);

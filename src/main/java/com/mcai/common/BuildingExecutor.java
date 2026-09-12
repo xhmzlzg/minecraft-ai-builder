@@ -2,6 +2,8 @@ package com.mcai.common;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 
 import com.mcai.MinecraftAIMod;
@@ -21,6 +23,7 @@ import net.minecraft.world.level.block.DoorBlock;
 import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.BedPart;
 import net.minecraft.world.level.block.state.properties.DoubleBlockHalf;
+import net.minecraft.world.level.block.state.properties.Property;
 
 /**
  * 在服务端执行方块放置，并记录旧状态用于撤销。
@@ -109,14 +112,21 @@ public class BuildingExecutor {
 				continue;
 			}
 			BlockState state = block.defaultBlockState();
+			// v1.1.0：优先按显式 blockstate 属性还原（楼梯朝向、半砖、脚手架 distance、
+			// 门/床的朝向、压力板/按钮、灯是否吊挂……），旧管线的后缀写法继续兼容。
+			if (e.props() != null && !e.props().isEmpty()) {
+				for (Map.Entry<String, String> en : e.props().entrySet()) {
+					state = applyProperty(state, block, en.getKey(), en.getValue());
+				}
+			}
 			// 门是两格方块：上半格必须显式标记为 UPPER，
 			// 否则默认 LOWER 状态因下方不是实心而掉落。
-			if (block instanceof DoorBlock) {
+			if (block instanceof DoorBlock && (e.props() == null || !e.props().containsKey("half"))) {
 				state = state.setValue(DoorBlock.HALF, upperDoor ? DoubleBlockHalf.UPPER : DoubleBlockHalf.LOWER);
 			}
 			// 床也是两格方块（尾+头）：只放一格会变成半张床。
 			// foot 在 R 格、head 朝 +x（East）方向一格。
-			if (block instanceof BedBlock) {
+			if (block instanceof BedBlock && (e.props() == null || !e.props().containsKey("part"))) {
 				state = state.setValue(BedBlock.PART, bedHead ? BedPart.HEAD : BedPart.FOOT);
 				state = state.setValue(BedBlock.FACING, Direction.EAST);
 			}
@@ -149,5 +159,25 @@ public class BuildingExecutor {
 		} catch (Exception e) {
 			return Blocks.AIR;
 		}
+	}
+
+	/** 按属性名找到方块状态属性并写入（属性名/取值非法就跳过，不让整栋楼失败） */
+	@SuppressWarnings({ "unchecked", "rawtypes" })
+	private static BlockState applyProperty(BlockState state, Block block, String name, String value) {
+		try {
+			for (Property<?> p : block.getStateDefinition().getProperties()) {
+				if (!p.getName().equals(name)) {
+					continue;
+				}
+				Optional<?> v = ((Property) p).getValue(value);
+				if (v.isEmpty()) {
+					return state;
+				}
+				return state.setValue((Property) p, (Comparable) v.get());
+			}
+		} catch (Exception ignored) {
+			// 单个属性失败不影响整体建造
+		}
+		return state;
 	}
 }
