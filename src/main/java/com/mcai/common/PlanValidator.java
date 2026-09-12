@@ -64,6 +64,28 @@ public final class PlanValidator {
 		return true;
 	}
 
+	/**
+	 * 是否能当"按钮/拉杆"的安装面：必须是完整实心方块。
+	 * 门、活板门、半砖、台阶、玻璃、栏杆、链条、脚手架、告示牌等都不算（游戏里会判定无支撑、按钮掉落）。
+	 */
+	public static boolean isSturdy(String id) {
+		String b = baseId(id);
+		if (b.equals("air") || b.equals("light") || b.equals("cave_air") || b.equals("void_air")) {
+			return false;
+		}
+		if (b.endsWith("_door") || b.endsWith("_trapdoor") || b.endsWith("_fence_gate")
+				|| b.endsWith("_fence") || b.endsWith("_slab") || b.endsWith("_stairs")
+				|| b.endsWith("_pane") || b.endsWith("_bars") || b.endsWith("_carpet")
+				|| b.endsWith("_sign") || b.endsWith("_banner") || b.endsWith("_button")
+				|| b.endsWith("_pressure_plate") || b.endsWith("_rail") || b.endsWith("_torch")
+				|| b.equals("lantern") || b.equals("soul_lantern") || b.equals("scaffolding")
+				|| b.equals("iron_bars") || b.contains("chain") || b.endsWith("_wall_sign")
+				|| b.endsWith("_wall_banner") || b.equals("end_rod") || b.equals("lightning_rod")) {
+			return false;
+		}
+		return true;
+	}
+
 	public static String baseId(String id) {
 		if (id == null) {
 			return "air";

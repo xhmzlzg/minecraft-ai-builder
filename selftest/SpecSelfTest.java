@@ -140,6 +140,38 @@ public class SpecSelfTest {
 		if (r.floors > 1) {
 			check(label + " → 多层有楼梯", stairs > 0);
 		}
+		// 本次修复的三条：对外单元门 / 门楣不漏空 / 铁门一定有开关
+		int openEntrance = 0;
+		int doorNoLintel = 0;
+		int ironDoorNoTrigger = 0;
+		int ironDoors = 0;
+		int switches = 0;
+		for (BuildingPlan.Entry e : p.entries) {
+			String id = PlanValidator.baseId(e.blockId());
+			if (id.endsWith("_door") && "lower".equals(e.props() == null ? "lower" : e.props().getOrDefault("half", "lower"))) {
+				// 贴着外圈的墙 = 对外门（不限朝向/材质）
+				if (e.x() == 0 || e.z() == 0 || e.x() == p.width - 1 || e.z() == p.depth - 1) {
+					openEntrance++;
+				}
+			}
+			if (id.equals("iron_door")) {
+				ironDoors++;
+			}
+			if (id.endsWith("_button") || id.endsWith("_pressure_plate")) {
+				switches++;
+			}
+			if (id.endsWith("_door") && (e.props() == null || !"upper".equals(e.props().get("half")))) {
+				// 门上方一格（门是 2 格高，再上面应该有墙 = 门楣）
+				BuildingPlan.Entry lintel = p.get(e.x(), e.y() + 2, e.z());
+				if (lintel == null) {
+					doorNoLintel++;
+				}
+			}
+		}
+		check(label + " → 有对外门(木门，可直接开)", openEntrance > 0);
+		check(label + " → 门楣不漏空 (" + doorNoLintel + " 处)", doorNoLintel == 0);
+		check(label + " → 没有铁门 (" + ironDoors + " 扇)", ironDoors == 0);
+		check(label + " → 没有按钮/压力板 (" + switches + " 个)", switches == 0);
 	}
 
 	private static void check(String what, boolean ok) {

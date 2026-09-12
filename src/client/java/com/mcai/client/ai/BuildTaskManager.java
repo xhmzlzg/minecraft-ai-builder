@@ -114,6 +114,15 @@ public class BuildTaskManager {
 						// 兼容：模型仍按旧契约回答（字符画蓝图）时走旧管线
 						plan = buildLegacy(reply, desc);
 					} else {
+						java.util.List<String> applied = com.mcai.common.spec.NotesParser.apply(spec);
+						if (!applied.isEmpty()) {
+							MinecraftAIMod.LOGGER.info("[Minecraft AI] notes 落实: {}", applied);
+						}
+						if (previousReply != null) {
+							// 记录"调整前后规格差异"，否则玩家会觉得"改了跟没改一样"
+							MinecraftAIMod.LOGGER.info("[Minecraft AI] 调整前后规格差异: {}",
+									diffSpec(previousReply, reply));
+						}
 						int[] box = boxSize();
 						SpecBuilder.Result res = SpecBuilder.build(spec, box[0], box[1], box[2]);
 						plan = res.plan;
@@ -163,6 +172,58 @@ public class BuildTaskManager {
 				Math.abs(bound.getX() - origin.getX()) + 1,
 				Math.abs(bound.getZ() - origin.getZ()) + 1,
 				Math.abs(bound.getY() - origin.getY()) + 1 };
+	}
+
+	/** 比较两次规格的关键字段，输出人类可读的差异（用于日志诊断"调整没生效"） */
+	private static String diffSpec(String oldRaw, String newRaw) {
+		BuildingSpec a = SpecParser.parse(oldRaw);
+		BuildingSpec b = SpecParser.parse(newRaw);
+		if (a == null || b == null) {
+			return "旧/新规格无法解析（旧=" + (a != null) + ", 新=" + (b != null) + "）";
+		}
+		StringBuilder sb = new StringBuilder();
+		if (!String.valueOf(a.archetype).equals(String.valueOf(b.archetype))) {
+			sb.append("archetype: ").append(a.archetype).append("→").append(b.archetype).append("; ");
+		}
+		if (!String.valueOf(a.floors).equals(String.valueOf(b.floors))) {
+			sb.append("floors: ").append(a.floors).append("→").append(b.floors).append("; ");
+		}
+		if (!String.valueOf(a.layerHeight).equals(String.valueOf(b.layerHeight))) {
+			sb.append("layer_height: ").append(a.layerHeight).append("→").append(b.layerHeight).append("; ");
+		}
+		if (!String.valueOf(a.size).equals(String.valueOf(b.size))) {
+			sb.append("size: ").append(a.size).append("→").append(b.size).append("; ");
+		}
+		if (a.rooms.size() != b.rooms.size()) {
+			sb.append("rooms 数量: ").append(a.rooms.size()).append("→").append(b.rooms.size()).append("; ");
+		} else {
+			for (int i = 0; i < a.rooms.size(); i++) {
+				BuildingSpec.RoomSpec ra = a.rooms.get(i);
+				BuildingSpec.RoomSpec rb = b.rooms.get(i);
+				if (!ra.type.equals(rb.type) || ra.x != rb.x || ra.z != rb.z || ra.w != rb.w || ra.d != rb.d) {
+					sb.append("房间[").append(i).append("]: ").append(ra.type).append(" ").append(ra.w).append("x")
+							.append(ra.d).append("@").append(ra.x).append(",").append(ra.z).append(" → ")
+							.append(rb.type).append(" ").append(rb.w).append("x").append(rb.d).append("@")
+							.append(rb.x).append(",").append(rb.z).append("; ");
+					break;
+				}
+			}
+		}
+		if (!String.valueOf(a.features).equals(String.valueOf(b.features))) {
+			sb.append("features: ").append(a.features).append("→").append(b.features).append("; ");
+		}
+		if (!String.valueOf(a.materials).equals(String.valueOf(b.materials))) {
+			sb.append("materials 有变化; ");
+		}
+		if (!String.valueOf(a.roof != null ? a.roof.style : null)
+				.equals(String.valueOf(b.roof != null ? b.roof.style : null))) {
+			sb.append("roof.style: ").append(a.roof != null ? a.roof.style : null).append("→")
+					.append(b.roof != null ? b.roof.style : null).append("; ");
+		}
+		if (!String.valueOf(a.notes).equals(String.valueOf(b.notes))) {
+			sb.append("notes 有变化（程序暂不解析 notes 内容）; ");
+		}
+		return sb.length() == 0 ? "无变化（模型原样返回了上一次的规格）" : sb.toString();
 	}
 
 	/** 结果已被查看（打开面板），悬浮球隐藏；方案数据保留供"调整上次方案"使用 */

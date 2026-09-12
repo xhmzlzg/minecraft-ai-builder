@@ -65,32 +65,34 @@ public class AiConfigScreen extends Screen {
 		int labelW = 76;
 		int fieldW = PANEL_W - 20 - labelW;
 		baseUrlField = new EditBox(this.font, x0 + 10 + labelW, fieldY, fieldW, 18, Component.literal("Base URL"));
-		baseUrlField.setValue(config.openaiBaseUrl);
+		// 注意：EditBox 构造时 maxLength 默认 32，必须先 setMaxLength 再 setValue，
+		// 否则载入的 API Key 会被静默截断成 32 字符（保存后 key 就废了）。
 		baseUrlField.setMaxLength(10000);
+		baseUrlField.setValue(config.openaiBaseUrl);
 		baseUrlField.setHint(Component.literal("以 /v1 结尾，如 https://api.deepseek.com/v1"));
 		addRenderableWidget(baseUrlField);
 
 		modelField = new EditBox(this.font, x0 + 10 + labelW, fieldY + 20, fieldW, 18, Component.literal("模型名"));
-		modelField.setValue(config.openaiModel);
 		modelField.setMaxLength(10000);
+		modelField.setValue(config.openaiModel);
 		modelField.setHint(Component.literal("如 mimo-v2.5、deepseek-chat"));
 		addRenderableWidget(modelField);
 
 		apiKeyField = new EditBox(this.font, x0 + 10 + labelW, fieldY + 40, fieldW, 18, Component.literal("API Key"));
-		apiKeyField.setValue(config.openaiApiKey);
 		apiKeyField.setMaxLength(10000);
+		apiKeyField.setValue(config.openaiApiKey);
 		apiKeyField.setHint(Component.literal("sk-xxx，仅保存在本地配置文件"));
 		addRenderableWidget(apiKeyField);
 
 		ollamaUrlField = new EditBox(this.font, x0 + 10 + labelW, fieldY + 60, fieldW, 18, Component.literal("Ollama 地址"));
-		ollamaUrlField.setValue(config.ollamaUrl);
 		ollamaUrlField.setMaxLength(10000);
+		ollamaUrlField.setValue(config.ollamaUrl);
 		ollamaUrlField.setHint(Component.literal("选择本地 Ollama 后端时使用"));
 		addRenderableWidget(ollamaUrlField);
 
 		ollamaModelField = new EditBox(this.font, x0 + 10 + labelW, fieldY + 80, fieldW, 18, Component.literal("Ollama 模型"));
-		ollamaModelField.setValue(config.ollamaModel);
 		ollamaModelField.setMaxLength(10000);
+		ollamaModelField.setValue(config.ollamaModel);
 		ollamaModelField.setHint(Component.literal("选择本地 Ollama 后端时使用"));
 		addRenderableWidget(ollamaModelField);
 

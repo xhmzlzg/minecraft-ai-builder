@@ -23,6 +23,9 @@ public class MinecraftAIClient implements ClientModInitializer {
 		CONFIG = AiConfig.load(FabricLoader.getInstance().getConfigDir());
 		MinecraftAIMod.LOGGER.info("[Minecraft AI] 当前 AI 后端: {} / 模型: {} / 思考: {}",
 				CONFIG.provider, CONFIG.modelName(), CONFIG.thinkingEnabled);
+		// 只记长度不记内容：一旦 key 被截断（历史 bug：EditBox 默认 maxLength=32）能立刻看出来
+		MinecraftAIMod.LOGGER.info("[Minecraft AI] API Key 长度: {} 字符（正常应为厂商完整长度，过短说明被截断）",
+				CONFIG.openaiApiKey == null ? 0 : CONFIG.openaiApiKey.length());
 
 		openScreenKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
 				"key.minecraft-ai.open_screen",

@@ -124,6 +124,11 @@ public class AiClient {
 			8. notes 写玩家提到的其它细节（颜色、风格、特殊要求），程序会尽量落实。
 			9. 被要求"按意见调整"时：你会看到自己上一次的规格 JSON 和玩家的修改意见，
 			   请输出【完整的新规格 JSON】（结构完全一致），只改需要改的字段，其余原样保留。
+			10. 调整时必须真的改动字段：玩家说"改户型/加房间/换材质/加层/换屋顶/封阳台"，
+			    就改 rooms / materials / floors / roof / features 里对应的值；rooms 对 chinese_highrise 同样生效
+			    （表示"一户"的布局，程序会按朝向镜像到另一户）。
+			11. 门、门楣、开门按钮/压力板、灯笼、光照、屋顶封顶这些由程序保证，不需要你写进规格。
+			12. 严禁原样返回上一次的规格：如果实在无法表达，就把要求写进 notes，并至少调整一个相关字段。
 			""";
 
 	private static final HttpClient HTTP = HttpClient.newBuilder()
@@ -155,13 +160,11 @@ public class AiClient {
 			JsonObject body = new JsonObject();
 			body.addProperty("model", cfg.modelName());
 			body.addProperty("stream", false);
-			// 思考模式：推理模型（如 DeepSeek）不限制思考预算，保证任何提示词的设计质量。
-			// 关闭时不传 thinking 字段，兼容不支持思考参数的供应商。
-			if (cfg.thinkingEnabled) {
-				JsonObject thinking = new JsonObject();
-				thinking.addProperty("type", "enabled");
-				body.add("thinking", thinking);
-			}
+			// 思考模式：默认按配置发送；若服务端因此报错，会在下面自动去掉该字段重试一次
+			// （不同厂商对 thinking 的支持不一，有的甚至会直接返回 500）。
+			boolean useThinking = cfg.thinkingEnabled;
+			JsonObject thinkingObj = new JsonObject();
+			thinkingObj.addProperty("type", "enabled");
 
 			JsonArray messages = new JsonArray();
 			JsonObject system = new JsonObject();
@@ -191,35 +194,74 @@ public class AiClient {
 			}
 			body.add("messages", messages);
 
-			HttpRequest.Builder rb = HttpRequest.newBuilder()
-					.uri(URI.create(endpoint))
-					.timeout(Duration.ofMinutes(10))
-					.header("Content-Type", "application/json")
-					.header("User-Agent", "minecraft-ai-mod")
-					.POST(HttpRequest.BodyPublishers.ofString(body.toString()));
-			if (!cfg.apiKey().isEmpty()) {
-				rb.header("Authorization", "Bearer " + cfg.apiKey());
-			}
-
-			try {
-				MinecraftAIMod.LOGGER.info("[Minecraft AI] 请求发出: model={} endpoint={}", cfg.modelName(), endpoint);
-				HttpResponse<String> response = HTTP.send(rb.build(), HttpResponse.BodyHandlers.ofString());
-				MinecraftAIMod.LOGGER.info("[Minecraft AI] 请求返回: HTTP {}", response.statusCode());
-				if (response.statusCode() != 200) {
-					throw new RuntimeException("AI 服务返回错误: HTTP " + response.statusCode()
-							+ " " + truncate(response.body(), 200) + "（请检查模型配置）");
+			// 最多尝试 3 次：
+			//   1) 服务端拒绝 thinking 参数时，自动去掉该参数重试；
+			//   2) 5xx / 429 / 408 / 超时 / 连接失败 时退避重试（偶发服务端故障能自愈）。
+			final int maxAttempts = 3;
+			String lastReason = null;
+			for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+				if (useThinking) {
+					body.add("thinking", thinkingObj);
+				} else {
+					body.remove("thinking");
 				}
-				return extractContent(response.body(), cfg);
-			} catch (java.net.ConnectException e) {
-				MinecraftAIMod.LOGGER.error("[Minecraft AI] 连接失败", e);
-				throw new RuntimeException("无法连接 AI 服务 " + endpoint + "（请检查 Ollama 是否启动/网络）", e);
-			} catch (java.net.http.HttpTimeoutException e) {
-				MinecraftAIMod.LOGGER.error("[Minecraft AI] 响应超时", e);
-				throw new RuntimeException("AI 响应超时（免费模型高峰期较慢，可重试）", e);
-			} catch (Exception e) {
-				MinecraftAIMod.LOGGER.error("[Minecraft AI] 请求失败: {}", e.getMessage(), e);
-				throw new RuntimeException("AI 请求失败: " + e.getMessage(), e);
+				HttpRequest.Builder rb = HttpRequest.newBuilder()
+						.uri(URI.create(endpoint))
+						.timeout(Duration.ofMinutes(10))
+						.header("Content-Type", "application/json")
+						.header("User-Agent", "minecraft-ai-mod")
+						.POST(HttpRequest.BodyPublishers.ofString(body.toString()));
+				if (!cfg.apiKey().isEmpty()) {
+					rb.header("Authorization", "Bearer " + cfg.apiKey());
+				}
+				try {
+					MinecraftAIMod.LOGGER.info("[Minecraft AI] 请求发出: model={} endpoint={} thinking={} (第 {} 次)",
+							cfg.modelName(), endpoint, useThinking, attempt);
+					HttpResponse<String> response = HTTP.send(rb.build(), HttpResponse.BodyHandlers.ofString());
+					int code = response.statusCode();
+					MinecraftAIMod.LOGGER.info("[Minecraft AI] 请求返回: HTTP {}", code);
+					if (code == 200) {
+						return extractContent(response.body(), cfg);
+					}
+					lastReason = describeError(code, response.body());
+					MinecraftAIMod.LOGGER.error("[Minecraft AI] 请求失败: {}", lastReason);
+					boolean retryable = code == 408 || code == 429 || code >= 500;
+					if (attempt < maxAttempts && useThinking) {
+						useThinking = false;
+						MinecraftAIMod.LOGGER.warn("[Minecraft AI] 去掉 thinking 参数后重试");
+						continue;
+					}
+					if (attempt < maxAttempts && retryable) {
+						long waitMs = 1200L * attempt;
+						MinecraftAIMod.LOGGER.warn("[Minecraft AI] {} ms 后重试", waitMs);
+						sleepQuietly(waitMs);
+						continue;
+					}
+					throw new RuntimeException(lastReason);
+				} catch (java.net.ConnectException e) {
+					lastReason = "无法连接 AI 服务 " + endpoint + "（请检查 Ollama 是否启动 / 网络是否可用）";
+					MinecraftAIMod.LOGGER.error("[Minecraft AI] 连接失败", e);
+					if (attempt < maxAttempts) {
+						sleepQuietly(1500L * attempt);
+						continue;
+					}
+					throw new RuntimeException(lastReason, e);
+				} catch (java.net.http.HttpTimeoutException e) {
+					lastReason = "AI 响应超时（免费/大模型高峰期较慢，可重试或换模型）";
+					MinecraftAIMod.LOGGER.error("[Minecraft AI] 响应超时", e);
+					if (attempt < maxAttempts) {
+						sleepQuietly(1500L * attempt);
+						continue;
+					}
+					throw new RuntimeException(lastReason, e);
+				} catch (RuntimeException re) {
+					throw re;   // 上面已经归类好的错误，直接抛给界面
+				} catch (Exception e) {
+					MinecraftAIMod.LOGGER.error("[Minecraft AI] 请求失败: {}", e.getMessage(), e);
+					throw new RuntimeException("AI 请求失败: " + e.getMessage(), e);
+				}
 			}
+			throw new RuntimeException(lastReason == null ? "AI 请求失败" : lastReason);
 		}, EXECUTOR);
 	}
 
@@ -276,7 +318,7 @@ public class AiClient {
 		return CompletableFuture.supplyAsync(() -> {
 			HttpRequest.Builder rb = HttpRequest.newBuilder()
 					.uri(URI.create(cfg.availabilityEndpoint()))
-					.timeout(Duration.ofSeconds(4))
+					.timeout(Duration.ofSeconds(10))
 					.header("User-Agent", "minecraft-ai-mod")
 					.GET();
 			if (!cfg.apiKey().isEmpty()) {
@@ -284,12 +326,47 @@ public class AiClient {
 			}
 			try {
 				HttpResponse<String> response = HTTP.send(rb.build(), HttpResponse.BodyHandlers.ofString());
-				return response.statusCode() == 200;
+				int code = response.statusCode();
+				if (code == 200) {
+					return true;
+				}
+				// 预检只是提示：各厂商对 /models 的支持不一（有的返回 401/404），
+				// 不能据此断言"后端不可达"，这里把真实原因记进日志。
+				MinecraftAIMod.LOGGER.warn("[Minecraft AI] 预检: {} → HTTP {}（{}）",
+						cfg.availabilityEndpoint(), code, describeError(code, response.body()));
+				return false;
 			} catch (Exception e) {
-				MinecraftAIMod.LOGGER.warn("[Minecraft AI] 后端不可用: {}", e.getMessage());
+				MinecraftAIMod.LOGGER.warn("[Minecraft AI] 预检失败: {}", e.getMessage());
 				return false;
 			}
 		}, EXECUTOR);
+	}
+
+	/** 把 HTTP 状态码翻译成"人话"，方便在状态栏直接看懂 */
+	private static String describeError(int code, String body) {
+		String hint = switch (code) {
+			case 400 -> "请求被拒绝(HTTP 400)：模型名或参数不被该后端接受";
+			case 401 -> "鉴权失败(HTTP 401)：API Key 无效（请在设置里重新粘贴完整 key，注意别被截断）";
+			case 402 -> "额度不足(HTTP 402)：请检查账户余额";
+			case 403 -> "无权限(HTTP 403)：该 key 不能访问此模型";
+			case 404 -> "接口或模型不存在(HTTP 404)：检查 Base URL 与模型名";
+			case 408 -> "请求超时(HTTP 408)";
+			case 429 -> "请求过于频繁或超出配额(HTTP 429)";
+			default -> code >= 500
+					? "AI 服务端错误(HTTP " + code + ")：通常是服务方故障，已自动重试"
+					: "AI 服务返回错误(HTTP " + code + ")";
+		};
+		String excerpt = truncate(body == null ? "" : body.replaceAll("\\s+", " "), 160);
+		return excerpt.isEmpty() ? hint : hint + " | " + excerpt;
+	}
+
+	/** Thread.sleep 的静默版（不抛受检异常，供 lambda 内使用） */
+	private static void sleepQuietly(long ms) {
+		try {
+			Thread.sleep(ms);
+		} catch (InterruptedException e) {
+			Thread.currentThread().interrupt();
+		}
 	}
 
 	private static String truncate(String s, int n) {

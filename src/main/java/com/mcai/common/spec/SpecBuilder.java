@@ -81,7 +81,7 @@ public final class SpecBuilder {
 		BuildingPlan plan = new BuildingPlan(spec.name, W, H, D);
 
 		boolean highrise = "chinese_highrise".equals(arch) && W >= 25 && D >= 17;
-		LayoutModel model = highrise ? highriseModel(W, D) : null;
+		LayoutModel model = highrise ? highriseModel(spec, W, D) : null;
 		if (model == null) {
 			model = genericModel(W, D, floors > 1);
 		}
@@ -106,12 +106,15 @@ public final class SpecBuilder {
 			for (int k = 1; k < floors; k++) {
 				for (int x = model.elevator.x0(); x <= model.elevator.x1(); x++) {
 					for (int z = model.elevator.z0(); z <= model.elevator.z1(); z++) {
+						if (holdsFixture(plan, x, k * lh + 1, z)) {
+							continue;   // 别把门/压力板/按钮脚下的地板掏掉
+						}
 						plan.remove(x, k * lh, z);
 					}
 				}
 			}
 			PartLib.elevator(plan, model.elevator.x0(), model.elevator.z0(), 0, floors, lh,
-					"iron_door", Math.max(1, floors - 3), floors * lh);
+					"spruce_door", Math.max(1, floors - 3), floors * lh);
 		}
 		buildRoof(plan, spec, pal, W, D, floors, lh);
 		buildFacade(plan, spec, pal, floors, lh, W, D);
@@ -121,10 +124,37 @@ public final class SpecBuilder {
 		}
 		// ---- 第三遍：把门口前后一格清出来（家具不许堵门）----
 		int cleared = clearDoorways(plan, doorCells);
+		// （v1.1.0 起建筑内不再生成铁门，也就无需"保证铁门能开"的兜底逻辑）
+		// ---- 第五遍：门楣兜底（门上方那一格必须是墙，不能漏空）----
+		fixDoorLintels(plan, pal);
 		com.mcai.common.PlanValidator.Report report =
 				com.mcai.common.PlanValidator.check(plan, lh, floors, model.seeds);
 		report.doorsUnblocked += cleared;   // 生成期主动清障，计入统计但不当作"遗留问题"
 		return new Result(plan, report, floors, lh);
+	}
+
+	/**
+	 * 保证每扇铁门都"能开"：优先补压力板/按钮；如果周围确实没有可安装的位置
+	 * （例如门就贴在井道/楼梯井边上），就把门设为常开，至少不会被关在里面。
+	 * 返回被强制打开的门数。
+	 */
+	/** 门是 2 格高，上面一格必须是实心墙（否则漏空、还能看到隔壁）——统一兜底补墙 */
+	private static void fixDoorLintels(BuildingPlan plan, BuildingSpec.Pal pal) {
+		for (BuildingPlan.Entry e : new ArrayList<>(plan.entries)) {
+			if (!PlanValidator.baseId(e.blockId()).endsWith("_door")) {
+				continue;
+			}
+			if (e.props() != null && "upper".equals(e.props().get("half"))) {
+				continue;
+			}
+			int lx = e.x();
+			int ly = e.y() + 2;
+			int lz = e.z();
+			BuildingPlan.Entry lintel = plan.get(lx, ly, lz);
+			if (lintel == null) {
+				plan.set(lx, ly, lz, pal.wall);
+			}
+		}
 	}
 
 	// ==================== 布局模型 ====================
@@ -137,7 +167,7 @@ public final class SpecBuilder {
 	}
 
 	/** 一梯两户板楼：西户 / 核心筒 / 东户 */
-	private static LayoutModel highriseModel(int W, int D) {
+	private static LayoutModel highriseModel(BuildingSpec spec, int W, int D) {
 		int coreW = 7;
 		int uD = D - 2;
 		int uBase = (W - coreW - 4) / 2;
@@ -153,8 +183,11 @@ public final class SpecBuilder {
 		int coreX0 = ax0 + uW1 + 1;
 		int bx0 = coreX0 + coreW + 1;
 
-		m.rooms.addAll(unitRooms(uW1, uD, ax0, 1, false));
-		m.rooms.addAll(unitRooms(uW2, uD, bx0, 1, true));
+		// 规格里给了房间表就用它（这样"调整意见"改户型才真的生效）；
+		// 没给则用内置的标准户型（已验证过的 11×15 布局）。
+		boolean custom = spec != null && spec.rooms != null && !spec.rooms.isEmpty();
+		m.rooms.addAll(custom ? unitRoomsFromSpec(spec, uW1, uD, ax0, 1, false) : unitRooms(uW1, uD, ax0, 1, false));
+		m.rooms.addAll(custom ? unitRoomsFromSpec(spec, uW2, uD, bx0, 1, true) : unitRooms(uW2, uD, bx0, 1, true));
 
 		int cx = coreX0;
 		int cz = 1;
@@ -182,6 +215,33 @@ public final class SpecBuilder {
 			int x0 = mirror ? (uW - 1 - sc.x1()) : sc.x0();
 			int x1 = mirror ? (uW - 1 - sc.x0()) : sc.x1();
 			out.add(new Layout.Room(type, new Layout.Rect(x0 + ox, sc.z0() + oz, x1 + ox, sc.z1() + oz)));
+		}
+		out = Layout.fix(out, ox + uW - 1, oz + uD - 1);
+		return separate(out);
+	}
+
+	/** 用 AI 给的房间表生成一户（按房间表自身包围盒等比缩放到 uW×uD，并按需镜像） */
+	private static List<Layout.Room> unitRoomsFromSpec(BuildingSpec spec, int uW, int uD, int ox, int oz,
+			boolean mirror) {
+		int minX = Integer.MAX_VALUE;
+		int minZ = Integer.MAX_VALUE;
+		int maxX = Integer.MIN_VALUE;
+		int maxZ = Integer.MIN_VALUE;
+		for (BuildingSpec.RoomSpec r : spec.rooms) {
+			minX = Math.min(minX, r.x);
+			minZ = Math.min(minZ, r.z);
+			maxX = Math.max(maxX, r.x + r.w - 1);
+			maxZ = Math.max(maxZ, r.z + r.d - 1);
+		}
+		int sw = Math.max(1, maxX - minX + 1);
+		int sd = Math.max(1, maxZ - minZ + 1);
+		List<Layout.Room> out = new ArrayList<>();
+		for (BuildingSpec.RoomSpec r : spec.rooms) {
+			Layout.Rect src = new Layout.Rect(r.x - minX, r.z - minZ, r.x + r.w - 1 - minX, r.z + r.d - 1 - minZ);
+			Layout.Rect sc = Layout.scale(src, sw, sd, uW, uD);
+			int x0 = mirror ? (uW - 1 - sc.x1()) : sc.x0();
+			int x1 = mirror ? (uW - 1 - sc.x0()) : sc.x1();
+			out.add(new Layout.Room(r.type, new Layout.Rect(x0 + ox, sc.z0() + oz, x1 + ox, sc.z1() + oz)));
 		}
 		out = Layout.fix(out, ox + uW - 1, oz + uD - 1);
 		return separate(out);
@@ -444,6 +504,22 @@ public final class SpecBuilder {
 		return e.props().get("facing");
 	}
 
+	/** 该格上方是不是"需要地板支撑"的东西（门下半格 / 压力板 / 按钮） */
+	private static boolean holdsFixture(BuildingPlan plan, int x, int y, int z) {
+		BuildingPlan.Entry e = plan.get(x, y, z);
+		if (e == null) {
+			return false;
+		}
+		String id = PlanValidator.baseId(e.blockId());
+		if (id.endsWith("_pressure_plate") || id.endsWith("_button")) {
+			return true;
+		}
+		if (id.endsWith("_door")) {
+			return e.props() == null || !"upper".equals(e.props().get("half"));
+		}
+		return false;
+	}
+
 	private static String floorMat(String type, BuildingSpec.Pal pal) {
 		return switch (type) {
 			case "kitchen", "bath", "bathroom", "toilet" -> pal.floorWet;
@@ -533,27 +609,38 @@ public final class SpecBuilder {
 
 	/** 两间房间之间可开门的墙格：[x, z, facing]，不相邻返回 null */
 	private static Object[] doorwayBetween(Layout.Rect a, Layout.Rect b) {
-		if (a.x1() + 2 == b.x0()) {
-			int z = Math.max(a.z0(), Math.max(b.z0(), Math.min((Math.max(a.z0(), b.z0())
-					+ Math.min(a.z1(), b.z1())) / 2, Math.min(a.z1(), b.z1()))));
-			return new Object[] { a.x1() + 1, z, "east" };
+		// 允许两间房之间隔 1~3 格墙（缩放后墙可能变厚），返回 {起点x, 起点z, facing, 墙厚}
+		int gap;
+		gap = b.x0() - a.x1() - 1;
+		if (gap >= 1 && gap <= 3) {
+			int z = overlapMid(a.z0(), a.z1(), b.z0(), b.z1());
+			return new Object[] { a.x1() + 1, z, "east", gap };
 		}
-		if (b.x1() + 2 == a.x0()) {
-			int z = Math.max(a.z0(), Math.max(b.z0(), Math.min((Math.max(a.z0(), b.z0())
-					+ Math.min(a.z1(), b.z1())) / 2, Math.min(a.z1(), b.z1()))));
-			return new Object[] { a.x0() - 1, z, "west" };
+		gap = a.x0() - b.x1() - 1;
+		if (gap >= 1 && gap <= 3) {
+			int z = overlapMid(a.z0(), a.z1(), b.z0(), b.z1());
+			return new Object[] { a.x0() - 1, z, "west", gap };
 		}
-		if (a.z1() + 2 == b.z0()) {
-			int x = Math.max(a.x0(), Math.max(b.x0(), Math.min((Math.max(a.x0(), b.x0())
-					+ Math.min(a.x1(), b.x1())) / 2, Math.min(a.x1(), b.x1()))));
-			return new Object[] { x, a.z1() + 1, "south" };
+		gap = b.z0() - a.z1() - 1;
+		if (gap >= 1 && gap <= 3) {
+			int x = overlapMid(a.x0(), a.x1(), b.x0(), b.x1());
+			return new Object[] { x, a.z1() + 1, "south", gap };
 		}
-		if (b.z1() + 2 == a.z0()) {
-			int x = Math.max(a.x0(), Math.max(b.x0(), Math.min((Math.max(a.x0(), b.x0())
-					+ Math.min(a.x1(), b.x1())) / 2, Math.min(a.x1(), b.x1()))));
-			return new Object[] { x, a.z0() - 1, "north" };
+		gap = a.z0() - b.z1() - 1;
+		if (gap >= 1 && gap <= 3) {
+			int x = overlapMid(a.x0(), a.x1(), b.x0(), b.x1());
+			return new Object[] { x, a.z0() - 1, "north", gap };
 		}
 		return null;
+	}
+
+	private static int overlapMid(int a0, int a1, int b0, int b1) {
+		int lo = Math.max(a0, b0);
+		int hi = Math.min(a1, b1);
+		if (hi < lo) {
+			return lo;
+		}
+		return (lo + hi) / 2;
 	}
 
 	/**
@@ -610,32 +697,89 @@ public final class SpecBuilder {
 				int dx = (int) d[0];
 				int dz = (int) d[1];
 				String facing = (String) d[2];
+				int gap = d.length > 3 ? (int) d[3] : 1;
+				int stepX = "east".equals(facing) ? 1 : ("west".equals(facing) ? -1 : 0);
+				int stepZ = "south".equals(facing) ? 1 : ("north".equals(facing) ? -1 : 0);
 				String ta = rooms.get(a).type();
 				String tb = rooms.get(b).type();
-				boolean iron = "stairs".equals(ta) || "stairs".equals(tb)
-						|| "lobby".equals(ta) || "lobby".equals(tb);
-				PartLib.clear(plan, dx, f + 1, dz, dx, f + lh - 1, dz);
-				PartLib.door(plan, dx, f + 1, dz, iron ? "iron_door" : "oak_door", facing, "left");
-				doorCells.add(new int[] { dx, f + 1, dz });
+				// 墙可能有 1~3 格厚：整条凿通（只凿 2 格高，上方保留墙体 = 门楣）
+				for (int i = 0; i < gap; i++) {
+					int wx = dx + stepX * i;
+					int wz = dz + stepZ * i;
+					PartLib.clear(plan, wx, f + 1, wz, wx, f + 2, wz);
+					if (i == 0) {
+						// 一律木门：手就能开，不需要任何按钮/压力板
+						PartLib.door(plan, wx, f + 1, wz, "oak_door", facing, "left");
+						doorCells.add(new int[] { wx, f + 1, wz });
+					}
+				}
 			}
 		}
-		// 一层：给玄关/客厅开一个对外的单元门
 		if (ground) {
+			carveEntrance(plan, rooms, f, lh, doorCells);
+		}
+	}
+
+	/**
+	 * 首层单元门：优先给玄关/门厅/候梯厅开对外的门（找不到就退而用客厅/主卧）。
+	 * 门默认"打开"状态 —— 玩家从外面就能直接进来，不用先找开关；
+	 * 门内侧还有压力板，进出时会保持敞开。
+	 */
+	private static void carveEntrance(BuildingPlan plan, List<Layout.Room> rooms, int f, int lh,
+			List<int[]> doorCells) {
+		// 优先顺序：玄关/门厅/候梯厅 → 主要房间 → 任意一间贴外墙的房间。
+		// 注意：最后一级仍然只在"真有房间贴外墙"的位置开门，不会在没有房间的墙面上凭空开洞。
+		String[][] prefs = {
+				{ "entry", "hall", "lobby" },
+				{ "living", "master", "bed2", "bed3", "dining", "kitchen", "study", "shop" },
+				{ "*" } };
+		for (String[] pref : prefs) {
 			for (Layout.Room room : rooms) {
 				String type = room.type();
-				if (!"entry".equals(type) && !"hall".equals(type) && !"living".equals(type)) {
+				boolean ok = false;
+				for (String p : pref) {
+					if (p.equals(type) || "*".equals(p)) {
+						ok = true;
+						break;
+					}
+				}
+				if (!ok) {
 					continue;
 				}
 				Layout.Rect r = room.r();
+				List<Object[]> cands = new ArrayList<>();
+				int mx = Math.max(r.x0(), Math.min((r.x0() + r.x1()) / 2, r.x1()));
+				int mz = Math.max(r.z0(), Math.min((r.z0() + r.z1()) / 2, r.z1()));
 				if (r.z0() == 1) {
-					int dx = Math.max(r.x0(), Math.min((r.x0() + r.x1()) / 2, r.x1()));
-					PartLib.clear(plan, dx, f + 1, 0, dx, f + 2, 0);
-					PartLib.door(plan, dx, f + 1, 0, "dark_oak_door", "south", "left");
-					doorCells.add(new int[] { dx, f + 1, 0 });
-					break;
+					cands.add(new Object[] { mx, 0, "north" });
 				}
+				if (r.z1() == plan.depth - 2) {
+					cands.add(new Object[] { mx, plan.depth - 1, "south" });
+				}
+				if (r.x0() == 1) {
+					cands.add(new Object[] { 0, mz, "east" });
+				}
+				if (r.x1() == plan.width - 2) {
+					cands.add(new Object[] { plan.width - 1, mz, "west" });
+				}
+				if (cands.isEmpty()) {
+					continue;
+				}
+				Object[] c = cands.get(0);
+				int dx = (int) c[0];
+				int dz = (int) c[1];
+				String facing = (String) c[2];
+				PartLib.clear(plan, dx, f + 1, dz, dx, f + 2, dz);
+				// 单元门也用木门（手就能开），不需要开关零件
+				PartLib.door(plan, dx, f + 1, dz, "dark_oak_door", facing, "left");
+				doorCells.add(new int[] { dx, f + 1, dz });
+				return;
 			}
 		}
+		// 不再"硬在北立面正中开洞"：这种兜底不顾建筑风格，太绝对。
+		// 若户型里确实没有任何房间贴外墙（例如整层被一圈走廊包住），
+		// 单元门会退化为"没有对外门"——此时请在描述里要求"让玄关贴外墙/加门厅"，
+		// 或直接用结构方块自己补一个门。
 	}
 
 	private static void buildStairs(BuildingPlan plan, LayoutModel model, int lh, int floors) {
@@ -644,9 +788,8 @@ public final class SpecBuilder {
 		for (int k = 1; k < floors; k++) {
 			for (int x = s.x0(); x <= s.x1(); x++) {
 				for (int z = s.z0(); z <= s.z0() + 6; z++) {
-					// 门下面的楼板不能掏（否则门会掉）——门通常在梯段区外，这里兜底保护
-					BuildingPlan.Entry above = plan.get(x, k * lh + 1, z);
-					if (above != null && PlanValidator.baseId(above.blockId()).endsWith("_door")) {
+					// 门/压力板/按钮脚下的楼板不能掏（否则它们会掉）
+					if (holdsFixture(plan, x, k * lh + 1, z)) {
 						continue;
 					}
 					plan.remove(x, k * lh, z);

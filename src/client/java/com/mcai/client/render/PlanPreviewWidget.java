@@ -56,7 +56,9 @@ public class PlanPreviewWidget {
 	}
 
 	private static final double TILE_W = 14.0;
-	private static final int MAX_RENDER = 12000;
+	private static final int MAX_RENDER = 6000;
+	/** 正在输入文字时的降级预算：配合"粗格合并"仍能看出外形，但绘制量足够小，打字不卡 */
+	private static final int LOW_DETAIL_RENDER = 600;
 	// 光照方向（视线空间），归一化
 	private static final double LIGHT_X = -0.35;
 	private static final double LIGHT_Y = 0.72;
@@ -82,6 +84,17 @@ public class PlanPreviewWidget {
 	private double cachedYaw = Double.NaN;
 	private double cachedPitch = Double.NaN;
 	private List<RenderCube> cachedList;
+	/** 低画质模式（输入框获得焦点时为 true）：只画少量方块，保证打字流畅 */
+	private boolean lowDetail;
+	private boolean cachedLowDetail;
+
+	/** 由界面调用：有输入框聚焦（正在打字）时降级绘制 */
+	public void setLowDetail(boolean low) {
+		if (this.lowDetail != low) {
+			this.lowDetail = low;
+			this.cachedList = null;   // 下次渲染重建列表
+		}
+	}
 
 	/** 视空间中的一个方块：8 顶点（已居中+旋转）、中心深度、6 面法线（视空间）、颜色 */
 	private static class RenderCube {
@@ -90,7 +103,10 @@ public class PlanPreviewWidget {
 		final double[][] normals;
 		final int color;
 
-		RenderCube(double[][] vertices, double depth, double[][] normals, int color) {
+		final boolean[] faces;
+
+		RenderCube(double[][] vertices, double depth, double[][] normals, int color, boolean[] faces) {
+			this.faces = faces;
 			this.v = vertices;
 			this.depth = depth;
 			this.normals = normals;
@@ -161,10 +177,12 @@ public class PlanPreviewWidget {
 		}
 
 		// 视角或方案变化时重算变换与排序（拖拽旋转时每帧重算，最多 12000 块，流畅）
-		if (cachedList == null || cachedPlan != plan || cachedYaw != yaw || cachedPitch != pitch) {
+		if (cachedList == null || cachedPlan != plan || cachedYaw != yaw || cachedPitch != pitch
+				|| cachedLowDetail != lowDetail) {
 			cachedPlan = plan;
 			cachedYaw = yaw;
 			cachedPitch = pitch;
+			cachedLowDetail = lowDetail;
 			cachedList = buildRenderList();
 		}
 
@@ -194,11 +212,71 @@ public class PlanPreviewWidget {
 		double my = plan.height / 2.0;
 		double mz = plan.depth / 2.0;
 
-		int total = plan.entries.size();
-		int stride = total <= MAX_RENDER ? 1 : (int) Math.ceil((double) total / MAX_RENDER);
-		List<RenderCube> list = new ArrayList<>(total / stride + 1);
-		for (int i = 0; i < total; i += stride) {
-			BuildingPlan.Entry e = plan.entries.get(i);
+		// v1.1.0 预览改进：
+		//   1) 先只保留"有暴露面"的方块（被包在里面的方块本来也看不见）——保证外形完整、不出现抽稀窟窿；
+		//   2) 仍然太多时按 2×2×2 / 3×3×3 粗化（每个粗格合并成一个方块），而不是随机抽稀；
+		//   3) 每块只画真正可见的面，绘制量再降一大截，这样打字时也不用把画质砍到看不清。
+		int budget = lowDetail ? LOW_DETAIL_RENDER : MAX_RENDER;
+		int lod = 1;
+		Map<Long, String> grid = null;
+		for (; lod <= 3; lod++) {
+			grid = buildVoxelGrid(lod);
+			int visible = 0;
+			for (Map.Entry<Long, String> en : grid.entrySet()) {
+				if (cellExposed(grid, en.getKey(), lod)) {
+					visible++;
+					if (visible > budget) {
+						break;
+					}
+				}
+			}
+			if (visible <= budget) {
+				break;
+			}
+		}
+		if (lod > 3) {
+			lod = 3;
+			grid = buildVoxelGrid(lod);
+		}
+		List<RenderCube> list = new ArrayList<>();
+		for (Map.Entry<Long, String> en : grid.entrySet()) {
+			long k = en.getKey();
+			int gx = (int) ((k >> 40) & 0xFFF);
+			int gy = (int) ((k >> 20) & 0xFFF);
+			int gz = (int) (k & 0xFFF);
+			if (!cellExposed(grid, k, lod)) {
+				continue;   // 完全被包住，画了也看不见
+			}
+			double[][] verts = new double[8][3];
+			int idx = 0;
+			for (int dy = 0; dy <= 1; dy++) {
+				for (int dz = 0; dz <= 1; dz++) {
+					for (int dx = 0; dx <= 1; dx++) {
+						verts[idx++] = transform(gx * lod + dx * lod - mx, gy * lod + dy * lod - my,
+								gz * lod + dz * lod - mz, sinY, cosY, sinP, cosP);
+					}
+				}
+			}
+			double[] center = transform(gx * lod + lod / 2.0 - mx, gy * lod + lod / 2.0 - my,
+					gz * lod + lod / 2.0 - mz, sinY, cosY, sinP, cosP);
+			double[][] modelNormals = { { 0, 1, 0 }, { 0, -1, 0 }, { 0, 0, -1 }, { 0, 0, 1 }, { -1, 0, 0 }, { 1, 0, 0 } };
+			double[][] normals = new double[6][3];
+			for (int n = 0; n < 6; n++) {
+				normals[n] = transform(modelNormals[n][0], modelNormals[n][1], modelNormals[n][2], sinY, cosY, sinP, cosP);
+			}
+			boolean[] faces = new boolean[6];
+			faces[0] = emptyAt(grid, gx, gy + 1, gz);
+			faces[1] = emptyAt(grid, gx, gy - 1, gz);
+			faces[2] = emptyAt(grid, gx, gy, gz - 1);
+			faces[3] = emptyAt(grid, gx, gy, gz + 1);
+			faces[4] = emptyAt(grid, gx - 1, gy, gz);
+			faces[5] = emptyAt(grid, gx + 1, gy, gz);
+			list.add(new RenderCube(verts, center[2], normals, colorOf(en.getValue()), faces));
+		}
+		if (list.isEmpty()) {
+			// 兜底：极端情况下至少画一层，避免预览全空
+			for (int i = 0; i < Math.min(64, plan.entries.size()); i++) {
+				BuildingPlan.Entry e = plan.entries.get(i);
 			double[][] verts = new double[8][3];
 			int idx = 0;
 			for (int dy = 0; dy <= 1; dy++) {
@@ -216,10 +294,48 @@ public class PlanPreviewWidget {
 			for (int n = 0; n < 6; n++) {
 				normals[n] = transform(modelNormals[n][0], modelNormals[n][1], modelNormals[n][2], sinY, cosY, sinP, cosP);
 			}
-			list.add(new RenderCube(verts, center[2], normals, colorOf(e.blockId())));
+			boolean[] allFaces = { true, true, true, true, true, true };
+			list.add(new RenderCube(verts, center[2], normals, colorOf(e.blockId()), allFaces));
+			}
 		}
 		list.sort((a, b) -> Double.compare(a.depth, b.depth));
 		return list;
+	}
+
+	/** 按 lod 倍率把方案压成粗格：(gx,gy,gz) -> 该格的代表方块 id */
+	private Map<Long, String> buildVoxelGrid(int lod) {
+		Map<Long, String> grid = new java.util.HashMap<>();
+		Map<Long, Integer> counts = new java.util.HashMap<>();
+		for (BuildingPlan.Entry e : plan.entries) {
+			String id = e.blockId();
+			if (id == null || id.endsWith("air") || id.endsWith("light")) {
+				continue;
+			}
+			long k = key(e.x() / lod, e.y() / lod, e.z() / lod);
+			int c = counts.merge(k, 1, Integer::sum);
+			if (c == 1) {
+				grid.put(k, id);
+			}
+		}
+		return grid;
+	}
+
+	private static long key(int x, int y, int z) {
+		return ((((long) x) & 0xFFF) << 40) | ((((long) y) & 0xFFF) << 20) | (((long) z) & 0xFFF);
+	}
+
+	private static boolean emptyAt(Map<Long, String> grid, int gx, int gy, int gz) {
+		return !grid.containsKey(key(gx, gy, gz));
+	}
+
+	/** 粗格是否至少有一面朝空（否则是被包住的内部格） */
+	private boolean cellExposed(Map<Long, String> grid, long k, int lod) {
+		int gx = (int) ((k >> 40) & 0xFFF);
+		int gy = (int) ((k >> 20) & 0xFFF);
+		int gz = (int) (k & 0xFFF);
+		return emptyAt(grid, gx, gy + 1, gz) || emptyAt(grid, gx, gy - 1, gz)
+				|| emptyAt(grid, gx, gy, gz - 1) || emptyAt(grid, gx, gy, gz + 1)
+				|| emptyAt(grid, gx - 1, gy, gz) || emptyAt(grid, gx + 1, gy, gz);
 	}
 
 	/** 模型坐标 -> 视空间：先绕 Y 轴偏航，再绕 X 轴俯仰 */
@@ -242,7 +358,14 @@ public class PlanPreviewWidget {
 	};
 
 	private void drawCube(GuiGraphicsExtractor context, RenderCube cube, int cx, int cy, double tw) {
+		// 屏幕上不足半个像素的方块直接跳过：看不见，但很吃绘制时间（缩小时尤其明显）
+		if (tw < 0.5) {
+			return;
+		}
 		for (int f = 0; f < 6; f++) {
+			if (cube.faces != null && !cube.faces[f]) {
+				continue;   // 该面被相邻方块挡住，不用画
+			}
 			double nx = cube.normals[f][0];
 			double ny = cube.normals[f][1];
 			double nz = cube.normals[f][2];

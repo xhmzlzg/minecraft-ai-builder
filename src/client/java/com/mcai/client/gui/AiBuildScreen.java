@@ -81,7 +81,10 @@ public class AiBuildScreen extends Screen {
 		AiClient.isAvailable(config).thenAcceptAsync(ok -> {
 			if (!ok && this.minecraft != null) {
 				this.minecraft.execute(() -> {
-					status = "警告：AI 后端不可达（" + config.chatEndpoint() + "），请检查配置或 Ollama 是否启动";
+					// 预检只是提示：不少厂商不支持 /models 或返回 401/404，不能据此判定"不可达"。
+					// 真正的错误会在点生成时按 HTTP 状态码明确报出来。
+					status = "提示：预检未通过（" + config.availabilityEndpoint()
+							+ "）；部分后端不支持该接口，可直接点生成，失败会显示具体原因";
 				});
 			}
 		}, Runnable::run);
@@ -519,6 +522,8 @@ public class AiBuildScreen extends Screen {
 		context.centeredText(this.font, "3D 预览（滚轮缩放 · 右键拖拽旋转 · 左键拖拽平移 · 双击复位）", cx, y0 + 100, 0xFFC0C0C0);
 
 		preview.setViewport(x0 + PANEL_W / 2, y0 + 131, PANEL_W - 16, 56);
+		// 有输入框聚焦（正在打字）时让预览降级绘制，避免软光栅化把输入拖卡
+		preview.setLowDetail(this.getFocused() != null);
 		preview.render(context);
 
 		drawStatus(context, x0 + 10, y0 + 168, PANEL_W - 20);

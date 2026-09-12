@@ -71,6 +71,59 @@ public final class PartLib {
 		door(p, x, y, z, id, facing, "left");
 	}
 
+	/**
+	 * 给铁门配"开门机关"：门前后地面各一块压力板（踩上去就开，两侧都是实心地板所以一定成立），
+	 * 再尽量在门旁边墙上装一个按钮（需要有实心方块当支撑）。
+	 * 木门不需要（手就能开）。
+	 */
+	public static void doorTriggers(BuildingPlan p, int x, int y, int z, String facing, boolean iron) {
+		if (!iron) {
+			return;
+		}
+		int dx = 0;
+		int dz = 0;
+		if ("north".equals(facing)) {
+			dz = 1;
+		} else if ("south".equals(facing)) {
+			dz = -1;
+		} else if ("east".equals(facing)) {
+			dx = -1;
+		} else if ("west".equals(facing)) {
+			dx = 1;
+		}
+		// 门前后：地板上有压力板
+		for (int s : new int[] { 1, -1 }) {
+			int px = x + dx * s;
+			int pz = z + dz * s;
+			if (p.isSupporting(px, y - 1, pz) && PlanValidator.isSupportingBlock("stone")) {
+				BuildingPlan.Entry cur = p.get(px, y, pz);
+				if (cur == null) {
+					p.add(px, y, pz, "stone_pressure_plate", props("powered", "false"));
+				}
+			}
+		}
+		// 按钮只能装在"门旁边、沿墙的那一格"，且背面必须是完整实心墙。
+		// 绝不放在门正前方/正后方（那是人走的通道，会出现"按钮悬在门前"的怪样子）。
+		int[] sideA = { -dz, dx };    // 门平面的两个切向（与门法线垂直）
+		int[] sideB = { dz, -dx };
+		for (int[] side : new int[][] { sideA, sideB }) {
+			int bx = x + side[0];
+			int bz = z + side[1];
+			if (p.get(bx, y, bz) != null) {
+				continue;
+			}
+			// 支撑必须在门的同一面墙上（再往外一格），并且是完整实心方块
+			int sx = bx + side[0];
+			int sz = bz + side[1];
+			if (!PlanValidator.isSturdy(p.get(sx, y, sz) == null ? "air" : p.get(sx, y, sz).blockId())) {
+				continue;
+			}
+			String f = side[0] > 0 ? "west" : (side[0] < 0 ? "east" : (side[1] > 0 ? "north" : "south"));
+			p.set(bx, y, bz, "stone_button", props("face", "wall", "facing", f, "powered", "false"));
+			return;
+		}
+	}
+
 	/** 窗带：装玻璃，两端用窗框色 */
 	public static void windowRun(BuildingPlan p, List<int[]> cells, int y0, int y1, String glass, String frame) {
 		boolean useFrame = cells.size() >= 4;
@@ -195,22 +248,16 @@ public final class PartLib {
 			}
 			p.set(x0, f, z0 + 2, "smooth_stone");
 			p.set(x0 + 1, f, z0 + 2, "smooth_stone");
-			p.set(x0, f + 1, z0 + 2, "stone_pressure_plate", props("powered", "false"));
-			p.set(x0 + 1, f + 1, z0 + 2, "stone_pressure_plate", props("powered", "false"));
-			// 电梯门（双开铁门，铰链朝两侧 = 向两边开）+ 门套铁块(按钮的支撑)
+			// 电梯门：双开木门（手就能开），铰链朝两侧 = 向两边开。
+			// 不放按钮/压力板 —— 按需求建筑里不再出现任何开关零件。
 			int doorZ = z0 + 3;
 			p.remove(x0, f + 2, doorZ);
 			p.remove(x0 + 1, f + 2, doorZ);
-			p.remove(x0, f + 3, doorZ);
-			p.remove(x0 + 1, f + 3, doorZ);
 			door(p, x0, f + 1, doorZ, doorId, "south", "right");
 			door(p, x0 + 1, f + 1, doorZ, doorId, "south", "left");
 			p.set(x0 + 2, f + 1, doorZ, "iron_block");
 			p.set(x0 + 2, f + 2, doorZ, "iron_block");
 			p.set(x0 + 2, f + 3, doorZ, "iron_block");
-			// 按钮背靠上面那块实心铁门套（facing=north 时支撑在 +z，即门套那格）
-			p.set(x0 + 2, f + 2, z0 + 2, "stone_button",
-					props("face", "wall", "facing", "north", "powered", "false"));
 		}
 	}
 
