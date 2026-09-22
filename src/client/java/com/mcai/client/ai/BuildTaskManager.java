@@ -1,15 +1,13 @@
 package com.mcai.client.ai;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
 
 import com.mcai.MinecraftAIClient;
 import com.mcai.MinecraftAIMod;
 import com.mcai.common.BuildingPlan;
-import com.mcai.common.PlanGenerator;
-import com.mcai.common.PlanParser;
-import com.mcai.common.PlanSpec;
 import com.mcai.common.spec.BuildingSpec;
 import com.mcai.common.spec.SpecBuilder;
 import com.mcai.common.spec.SpecParser;
@@ -17,43 +15,109 @@ import com.mcai.common.spec.SpecParser;
 import net.minecraft.client.Minecraft;
 
 /**
- * 全局生成任务管理器：AI 生成在后台线程执行，界面关闭/重开不影响任务与结果。
- * 状态仅保存在这里（不在 Screen 实例里），面板每次打开从这里恢复。
+ * 全局生成任务 + 对话会话管理器。
+ * 界面关闭/重开不影响任务与结果；会话保存消息历史，同一会话继续发言 = 修改上次方案。
  */
 public class BuildTaskManager {
 	public enum Phase { IDLE, GENERATING, SUCCESS, FAILED }
 
 	public static final BuildTaskManager INSTANCE = new BuildTaskManager();
 
+	/** 聊天消息角色 */
+	public enum MsgRole { USER, AI, SYSTEM, ERROR }
+
+	/** 一条聊天消息（对话式界面用） */
+	public static final class ChatMsg {
+		public final MsgRole role;
+		public String text;
+		public String thinking = "";
+		public boolean thinkingExpanded = false;
+		/** AI 消息附带的方案（可展示 3D 预览 / 确认建造） */
+		public BuildingPlan plan;
+		public boolean planReady = false;
+
+		public ChatMsg(MsgRole role, String text) {
+			this.role = role;
+			this.text = text == null ? "" : text;
+		}
+	}
+
+	/** 一个对话会话：新会话 = 新建筑；同一会话继续发 = 修改 */
+	public static final class ChatSession {
+		public final String id = UUID.randomUUID().toString();
+		public String title = "新会话";
+		public final List<ChatMsg> messages = new ArrayList<>();
+		/** 最近一次成功方案的原始 JSON（迭代调整的对话历史） */
+		public String rawReply;
+		public BuildingPlan plan;
+		public String warnText = "";
+		public boolean adjusted = false;
+		public net.minecraft.core.BlockPos origin;
+		public net.minecraft.core.BlockPos bound;
+	}
+
+	private final List<ChatSession> sessions = new ArrayList<>();
+	private ChatSession current = new ChatSession();
+
 	private Phase phase = Phase.IDLE;
 	private String description = "";
 	private String posText = "";
-	/** 最近一次成功方案的原始 JSON（迭代调整的对话历史） */
-	private String rawReply = null;
-	private BuildingPlan plan = null;
 	private String errorMsg = "";
 	private long startMs;
-	/** 当前方案是否由"按意见调整"生成（确认建造时自动替换旧建筑） */
-	private boolean adjusted = false;
-	/** 有未被查看过的新结果（球提示 / 按K直接展示；查看后清除） */
 	private boolean freshResult = false;
-	/** 生成时的建造原点与空间约束（重开面板恢复显示用） */
-	private net.minecraft.core.BlockPos origin;
-	private net.minecraft.core.BlockPos bound;
+	/** 流式思考实时文本（生成中界面轮询） */
+	private volatile String liveThinking = "";
+	private volatile String liveContent = "";
 
-	private BuildTaskManager() {
+	public BuildTaskManager() {
+		sessions.add(current);
 	}
+
+	// ==================== 会话 ====================
+
+	public List<ChatSession> sessions() {
+		return sessions;
+	}
+
+	public ChatSession session() {
+		return current;
+	}
+
+	public void newSession() {
+		// 保留空的旧会话列表；新建一个空会话
+		current = new ChatSession();
+		sessions.add(current);
+		// 上限 10 个会话，丢掉最旧的
+		while (sessions.size() > 10) {
+			sessions.remove(0);
+		}
+		phase = Phase.IDLE;
+		errorMsg = "";
+		liveThinking = "";
+		liveContent = "";
+	}
+
+	public void switchTo(ChatSession s) {
+		if (s != null && sessions.contains(s)) {
+			current = s;
+			phase = Phase.IDLE;
+			liveThinking = "";
+			liveContent = "";
+		}
+	}
+
+	// ==================== 状态 ====================
 
 	public boolean hasFreshResult() {
 		return freshResult;
 	}
 
 	public net.minecraft.core.BlockPos origin() {
-		return origin;
+		return current.origin;
 	}
 
 	public net.minecraft.core.BlockPos bound() {
-		return bound;
+		return current.bound;
 	}
 
 	public boolean isGenerating() {
@@ -65,81 +129,235 @@ public class BuildTaskManager {
 	}
 
 	public BuildingPlan plan() {
-		return plan;
+		return current.plan;
 	}
 
 	public boolean isAdjusted() {
-		return adjusted;
+		return current.adjusted;
 	}
 
 	public String errorMsg() {
 		return errorMsg;
 	}
 
+	public String warnText() {
+		return current.warnText;
+	}
+
 	public long elapsedSeconds() {
 		return (System.currentTimeMillis() - startMs) / 1000;
 	}
 
-	/** 全新设计 */
-	public void start(Minecraft client, String desc, String pos,
+	public String liveThinking() {
+		return liveThinking;
+	}
+
+	public String liveContent() {
+		return liveContent;
+	}
+
+	/** 发送聊天消息：会话里已有方案则视为「修改」，否则「新生成」 */
+	public void send(Minecraft client, String desc, String pos,
 			net.minecraft.core.BlockPos buildOrigin, net.minecraft.core.BlockPos buildBound) {
 		this.description = desc;
 		this.posText = pos;
-		this.origin = buildOrigin;
-		this.bound = buildBound;
-		this.adjusted = false;
-		launch(client, null, null);
+		this.current.origin = buildOrigin;
+		this.current.bound = buildBound;
+		this.current.adjusted = current.rawReply != null;
+		current.messages.add(new ChatMsg(MsgRole.USER, desc));
+		if (current.title.equals("新会话") || current.messages.size() == 1) {
+			current.title = desc.length() > 12 ? desc.substring(0, 12) + "…" : desc;
+		}
+		launch(client, current.rawReply, current.rawReply != null ? desc : null);
 	}
 
-	/** 基于当前方案按意见调整 */
+	/** 兼容旧调用：全新设计 */
+	public void start(Minecraft client, String desc, String pos,
+			net.minecraft.core.BlockPos buildOrigin, net.minecraft.core.BlockPos buildBound) {
+		send(client, desc, pos, buildOrigin, buildBound);
+	}
+
+	/** 兼容旧调用：基于当前方案按意见调整 */
 	public void adjust(Minecraft client, String opinion) {
-		launch(client, rawReply, opinion);
+		current.adjusted = true;
+		current.messages.add(new ChatMsg(MsgRole.USER, opinion));
+		launch(client, current.rawReply, opinion);
+	}
+
+	public void cancel() {
+		AiClient.cancelActive();
+		// 文案由请求异常路径统一写入，避免重复气泡
 	}
 
 	private void launch(Minecraft client, String previousReply, String adjustment) {
+		launch(client, previousReply, adjustment, null, 0);
+	}
+
+	/**
+	 * @param repairHint 非空 = 上一轮结果被程序判定不合格，带着"错在哪"重做一次
+	 * @param attempt    已重做次数（只允许重做 1 次，避免无限循环）
+	 */
+	private void launch(Minecraft client, String previousReply, String adjustment, String repairHint, int attempt) {
 		phase = Phase.GENERATING;
-		startMs = System.currentTimeMillis();
+		if (attempt == 0) {
+			startMs = System.currentTimeMillis();
+		}
 		errorMsg = "";
+		current.warnText = "";
+		liveThinking = "";
+		liveContent = "";
 		String desc = description;
-		CompletableFuture<String> pending = AiClient.askPlan(desc, posText, MinecraftAIClient.CONFIG,
-				previousReply, adjustment);
+
+		AiClient.StreamListener listener = new AiClient.StreamListener() {
+			@Override
+			public void onThinking(String delta) {
+				liveThinking = liveThinking + delta;
+			}
+
+			@Override
+			public void onContent(String delta) {
+				liveContent = liveContent + delta;
+			}
+		};
+
+		// 新生成：两阶段（设计要点 → ops）。调整 / 自动重做：直接阶段二。
+		if (previousReply == null && repairHint == null && attempt == 0) {
+			current.messages.add(new ChatMsg(MsgRole.SYSTEM, "① 正在出设计要点…"));
+			AiClient.askDesignBrief(desc, posText, MinecraftAIClient.CONFIG, listener)
+					.thenAcceptAsync(briefReply -> {
+						String brief = briefReply.content == null ? "" : briefReply.content.trim();
+						String think1 = briefReply.thinking == null ? "" : briefReply.thinking;
+						if (!think1.isEmpty()) {
+							ChatMsg tmsg = new ChatMsg(MsgRole.AI, "设计思考（阶段1）");
+							tmsg.thinking = think1;
+							current.messages.add(tmsg);
+						}
+						if (brief.isEmpty()) {
+							current.messages.add(new ChatMsg(MsgRole.ERROR, "设计要点为空，无法继续绘制"));
+							phase = Phase.FAILED;
+							errorMsg = "设计要点为空";
+							return;
+						}
+						// 去掉可能的代码围栏
+						String briefJson = brief.replaceAll("^```(?:json)?\\s*", "").replaceAll("\\s*```$", "").trim();
+						ChatMsg bmsg = new ChatMsg(MsgRole.AI, "设计要点：\n" + truncateBrief(briefJson));
+						current.messages.add(bmsg);
+						current.messages.add(new ChatMsg(MsgRole.SYSTEM, "② 按设计要点绘制方块…"));
+						liveThinking = "";
+						// 阶段二：带着设计要点画 ops
+						launchOps(client, desc, previousReply, adjustment, repairHint, attempt, briefJson, listener);
+					}, client)
+					.exceptionally(e -> {
+						Throwable t = e;
+						while (t.getCause() != null) {
+							t = t.getCause();
+						}
+						String msg = t.getMessage() == null ? t.toString() : t.getMessage();
+						if (t instanceof AiClient.CancelledException || "已取消本次生成".equals(msg)) {
+							errorMsg = "已取消本次生成";
+							current.messages.add(new ChatMsg(MsgRole.SYSTEM, "已取消本次生成"));
+						} else {
+							errorMsg = "设计要点失败：" + msg;
+							current.messages.add(new ChatMsg(MsgRole.ERROR, errorMsg));
+						}
+						phase = Phase.FAILED;
+						return null;
+					});
+			return;
+		}
+		launchOps(client, desc, previousReply, adjustment, repairHint, attempt, null, listener);
+	}
+
+	private static String truncateBrief(String s) {
+		String one = s.replaceAll("\\s+", " ");
+		return one.length() <= 180 ? one : one.substring(0, 180) + "…";
+	}
+
+	/** 阶段二：输出 freeform ops 并展开建造。designBrief 可空（调整/重做时靠 previousReply）。 */
+	private void launchOps(Minecraft client, String desc, String previousReply, String adjustment,
+			String repairHint, int attempt, String designBrief, AiClient.StreamListener listener) {
+		String pos = posText;
+		if (designBrief != null && !designBrief.isEmpty()) {
+			pos = posText + "\n【设计要点（必须遵守）】\n" + designBrief
+					+ "\n请按上述要点输出完整 freeform JSON（紧凑 ops：优先 box，总 ops≤25，能 mirror 就 mirror）。";
+		}
+		CompletableFuture<AiClient.AiReply> pending = AiClient.askPlan(desc, pos, MinecraftAIClient.CONFIG,
+				previousReply, adjustment, repairHint, listener);
 		pending.thenAcceptAsync(reply -> {
 			try {
-				MinecraftAIMod.LOGGER.info("[Minecraft AI] AI 回复: {}", reply);
-				if (SpecParser.looksLegacy(reply)) {
-					plan = buildLegacy(reply, desc);
-				} else {
-					BuildingSpec spec = SpecParser.parse(reply);
-					if (spec == null) {
-						// 兼容：模型仍按旧契约回答（字符画蓝图）时走旧管线
-						plan = buildLegacy(reply, desc);
-					} else {
-						java.util.List<String> applied = com.mcai.common.spec.NotesParser.apply(spec);
-						if (!applied.isEmpty()) {
-							MinecraftAIMod.LOGGER.info("[Minecraft AI] notes 落实: {}", applied);
-						}
-						if (previousReply != null) {
-							// 记录"调整前后规格差异"，否则玩家会觉得"改了跟没改一样"
-							MinecraftAIMod.LOGGER.info("[Minecraft AI] 调整前后规格差异: {}",
-									diffSpec(previousReply, reply));
-						}
-						int[] box = boxSize();
-						SpecBuilder.Result res = SpecBuilder.build(spec, box[0], box[1], box[2]);
-						plan = res.plan;
-						MinecraftAIMod.LOGGER.info(
-								"[Minecraft AI] 规格展开: archetype={} floors={} layerHeight={} 方块数={}",
-								spec.archetype, res.floors, res.layerHeight, plan.size());
-						MinecraftAIMod.LOGGER.info("[Minecraft AI] 体检: {}", res.report.summary());
-						for (String p : res.report.problems) {
-							MinecraftAIMod.LOGGER.warn("[Minecraft AI] 遗留问题: {}", p);
-						}
-					}
+				String think = reply.thinking;
+				String text = reply.content;
+				MinecraftAIMod.LOGGER.info("[Minecraft AI] AI 思考: {}", think == null ? "" : think.substring(0, Math.min(think.length(), 200)));
+				MinecraftAIMod.LOGGER.info("[Minecraft AI] AI 回复: {}", text);
+				String hint = attempt < 1 ? mismatchHint(desc, text, previousReply, adjustment) : null;
+				if (hint != null) {
+					MinecraftAIMod.LOGGER.warn("[Minecraft AI] 结果不合格，自动重新生成一次：{}", hint);
+					current.messages.add(new ChatMsg(MsgRole.SYSTEM, "结果不合格，自动重做一次…"));
+					launchOps(client, desc, previousReply, adjustment, hint, attempt + 1, designBrief, listener);
+					return;
 				}
-				rawReply = reply;
+				BuildingSpec spec = SpecParser.parse(text);
+				if (spec == null) {
+					throw new IllegalStateException(
+							"AI 的回复不是可用的规格 JSON（可能被输出长度截断、夹了说明文字，"
+									+ "或还在用已删除的旧格式）。请重试；若反复如此，"
+									+ "请在描述里要求画简单些，或在配置里关掉思考模式 / 换一个输出上限更大的模型。");
+				}
+				if (previousReply != null) {
+					MinecraftAIMod.LOGGER.info("[Minecraft AI] 调整前后规格差异: {}", diffSpec(previousReply, text));
+				}
+				int[] box = boxSize();
+				SpecBuilder.Result res = SpecBuilder.build(spec, box[0], box[1], box[2]);
+				BuildingPlan plan = res.plan;
+				if (plan.size() == 0 && attempt < 1) {
+					MinecraftAIMod.LOGGER.warn("[Minecraft AI] 展开后 0 个方块，自动重新生成一次");
+					current.messages.add(new ChatMsg(MsgRole.SYSTEM, "方案为空，自动重做一次…"));
+					launchOps(client, desc, previousReply, adjustment,
+							"你的 ops 一个方块都没画出来（方案是空的）。常见原因："
+									+ "① layer 的 rows 用了 palette 里没定义的字符 —— 每个出现的字符都必须在 palette 里说明是什么方块；"
+									+ "② 坐标超出 size 范围或写了负数 —— 坐标从 0 开始，要求 x<宽、y<高、z<进深；"
+									+ "③ block 字段不是合法方块 id —— 只能写原版 id（如 oak_planks、stone_bricks），"
+									+ "不要写中文、不要自造名字，blockstate 属性要单独放在 props 里。"
+									+ "请修正后重新输出完整的 freeform JSON。",
+							attempt + 1, designBrief, listener);
+					return;
+				}
+				MinecraftAIMod.LOGGER.info(
+						"[Minecraft AI] 自由形体展开: mirror={} ops={} 尺寸={}x{}x{} 方块数={} 孤立={}",
+						spec.freeform.mirror, spec.freeform.ops.size(),
+						plan.width, plan.height, plan.depth, plan.size(), res.isolated);
+				for (String w : res.warnings) {
+					MinecraftAIMod.LOGGER.warn("[Minecraft AI] 展开警告: {}", w);
+				}
+				current.warnText = summarizeWarnings(res.warnings);
+				MinecraftAIMod.LOGGER.info(
+						"[Minecraft AI] 跳过建筑体检（悬空件按设计保留）；孤立方块 {} 个", res.isolated);
+
+				current.rawReply = text;
+				current.plan = plan;
+				current.adjusted = previousReply != null;
+
+				ChatMsg aiMsg = new ChatMsg(MsgRole.AI, summarizePlan(plan, current.warnText));
+				aiMsg.thinking = think == null ? "" : think;
+				aiMsg.plan = plan;
+				aiMsg.planReady = true;
+				current.messages.add(aiMsg);
+
+				liveThinking = "";
+				liveContent = "";
 				freshResult = true;
 				phase = Phase.SUCCESS;
 			} catch (Exception e) {
-				errorMsg = e.getMessage() == null ? e.toString() : e.getMessage();
+				String msg = e.getMessage() == null ? e.toString() : e.getMessage();
+				if (e instanceof AiClient.CancelledException || "已取消本次生成".equals(msg)) {
+					errorMsg = "已取消本次生成";
+					current.messages.add(new ChatMsg(MsgRole.SYSTEM, "已取消本次生成"));
+					phase = Phase.FAILED;
+					return;
+				}
+				errorMsg = msg;
+				current.warnText = "";
+				current.messages.add(new ChatMsg(MsgRole.ERROR, errorMsg));
 				phase = Phase.FAILED;
 			}
 		}, client).exceptionally(e -> {
@@ -147,106 +365,165 @@ public class BuildTaskManager {
 			while (t.getCause() != null) {
 				t = t.getCause();
 			}
-			errorMsg = t.getMessage() == null ? t.toString() : t.getMessage();
+			String msg = t.getMessage() == null ? t.toString() : t.getMessage();
+			if (t instanceof AiClient.CancelledException || "已取消本次生成".equals(msg)) {
+				errorMsg = "已取消本次生成";
+				current.messages.add(new ChatMsg(MsgRole.SYSTEM, "已取消本次生成"));
+				phase = Phase.FAILED;
+				return null;
+			}
+			errorMsg = msg;
+			current.warnText = "";
+			current.messages.add(new ChatMsg(MsgRole.ERROR, errorMsg));
 			phase = Phase.FAILED;
 			return null;
 		});
 	}
 
-	/** 旧契约（字符画蓝图）管线，保留兼容 */
-	private BuildingPlan buildLegacy(String reply, String desc) {
-		PlanSpec spec = PlanParser.parse(reply);
-		PlanParser.applyFloorHint(spec, extractFloorHint(desc));
-		MinecraftAIMod.LOGGER.info("[Minecraft AI] 旧契约蓝图: name={} floors={} wall={} accent={} roof={} maps={}",
-				spec.name, spec.floors, spec.wall, spec.accent, spec.roof,
-				spec.floorsMap == null ? 0 : spec.floorsMap.size());
-		return PlanGenerator.generate(spec, desc);
+	private static String summarizePlan(BuildingPlan plan, String warn) {
+		String s = "方案「" + plan.name + "」" + plan.width + "x" + plan.height + "x" + plan.depth
+				+ "，共 " + plan.size() + " 个方块。确认后生成到世界里。";
+		if (warn != null && !warn.isEmpty()) {
+			s += " 注意：" + warn;
+		}
+		return s;
 	}
 
-	/** 玩家框选范围 → [宽, 进深, 高] */
+	// ==================== 结果校验（"AI 不按提示词生成"的机械兜底） ====================
+
+	private static String summarizeWarnings(java.util.List<String> warnings) {
+		if (warnings == null || warnings.isEmpty()) {
+			return "";
+		}
+		StringBuilder sb = new StringBuilder();
+		int shown = 0;
+		for (String w : warnings) {
+			if (shown == 3) {
+				break;
+			}
+			if (shown > 0) {
+				sb.append("；");
+			}
+			sb.append(w);
+			shown++;
+		}
+		if (warnings.size() > shown) {
+			sb.append("；等共 ").append(warnings.size()).append(" 条（详见日志）");
+		}
+		String s = sb.toString();
+		return s.length() <= 160 ? s : s.substring(0, 160) + "…";
+	}
+
+	private static String mismatchHint(String desc, String reply, String previousReply, String adjustment) {
+		BuildingSpec spec = SpecParser.parse(reply);
+		String low = reply == null ? "" : reply.toLowerCase();
+		if (spec == null) {
+			if (low.contains("floors_map")) {
+				return "你输出的是【旧版字符画蓝图】格式（含 floors_map），本模组已经把它整条管线删除了。"
+						+ "请改用 \"kind\":\"freeform\" + ops（layer 分层字符画 / box / cyl / sphere）"
+						+ "亲手画出「" + desc + "」的外形。只输出 JSON，禁止任何其他文字，不要代码块。";
+			}
+			if (low.contains("\"building\"") || low.contains("archetype")) {
+				return "本模组已删除**全部建筑模板**：kind=\"building\" / archetype 不再有任何实现，"
+						+ "程序一格方块都盖不出来。请改用 \"kind\":\"freeform\"，"
+						+ "用 ops（layer 分层字符画 / box / cyl / sphere）亲手把「" + desc + "」画出来："
+						+ "地基/楼板用 box，墙体用 4 个 box（别用 hollow），门窗用 box 盖在墙上，"
+						+ "楼梯用 *_stairs + props{\"facing\":...,\"half\":\"bottom\"}，屋顶用 box 铺。"
+						+ "只输出 JSON，禁止任何其他文字，不要代码块。";
+			}
+			if (low.contains("\"ops\"") || low.contains("\"kind\"") || low.contains("freeform")) {
+				return "你的回复不是一段完整的 JSON，程序解析失败。常见原因："
+						+ "① 被输出长度截断 —— 请把作品画简单些（一艘船 10~15 个 op 就够，一栋小屋 20~30 个）；"
+						+ "② JSON 前后夹了说明文字 —— 请只输出 JSON 本身，不要任何解释；"
+						+ "③ 用了中文引号 / 中文逗号 —— 请全部用英文半角符号。"
+						+ "请重新输出【完整且合法】的 JSON。";
+			}
+			return null;
+		}
+		if (spec.freeform.ops.isEmpty()) {
+			return "你的规格里一个绘制指令（ops）都没有，程序会盖出 0 个方块。"
+					+ "请用 \"kind\":\"freeform\" + ops（layer 分层字符画 / box / cyl / sphere）"
+					+ "亲手把「" + desc + "」画出来：地基/楼板用 box，墙体用 4 个 box（别用 hollow），"
+					+ "门窗用 box 盖在墙上，楼梯用 *_stairs + props{\"facing\":...,\"half\":\"bottom\"}，"
+					+ "屋顶用 box 铺。只输出 JSON，禁止任何其他文字，不要代码块。";
+		}
+		if (previousReply != null && noChange(previousReply, reply)) {
+			return "你这次输出的规格与上一次【完全相同】，等于没有做任何调整。"
+					+ "请真的改动字段（ops / size / palette / mirror），"
+					+ "或者如果玩家要的其实是另一种东西（例如从「楼」改成「船」），"
+					+ "必须重新用 ops 描述外形。";
+		}
+		return null;
+	}
+
+	private static boolean noChange(String oldRaw, String newRaw) {
+		return diffSpec(oldRaw, newRaw).startsWith("无变化");
+	}
+
+	private static String freeformSignature(com.mcai.common.spec.FreeformSpec f) {
+		if (f == null) {
+			return "-";
+		}
+		StringBuilder sb = new StringBuilder();
+		sb.append(f.size).append('|').append(f.mirror).append('|').append(f.ops.size()).append('|');
+		for (com.mcai.common.spec.FreeformSpec.Op o : f.ops) {
+			sb.append(o.op).append(o.y).append(o.block).append(o.hollow)
+					.append(java.util.Arrays.toString(o.from)).append(java.util.Arrays.toString(o.to))
+					.append(o.x).append(o.z).append(o.y0).append(o.y1)
+					.append(o.r).append(o.rx).append(o.ry).append(o.rz)
+					.append(o.props)
+					.append(o.rows == null ? "" : o.rows.toString())
+					.append(';');
+		}
+		return sb.toString();
+	}
+
 	private int[] boxSize() {
-		if (origin == null || bound == null) {
+		if (current.origin == null || current.bound == null) {
 			return new int[] { 33, 19, 64 };
 		}
 		return new int[] {
-				Math.abs(bound.getX() - origin.getX()) + 1,
-				Math.abs(bound.getZ() - origin.getZ()) + 1,
-				Math.abs(bound.getY() - origin.getY()) + 1 };
+				Math.abs(current.bound.getX() - current.origin.getX()) + 1,
+				Math.abs(current.bound.getZ() - current.origin.getZ()) + 1,
+				Math.abs(current.bound.getY() - current.origin.getY()) + 1 };
 	}
 
-	/** 比较两次规格的关键字段，输出人类可读的差异（用于日志诊断"调整没生效"） */
 	private static String diffSpec(String oldRaw, String newRaw) {
 		BuildingSpec a = SpecParser.parse(oldRaw);
 		BuildingSpec b = SpecParser.parse(newRaw);
 		if (a == null || b == null) {
 			return "旧/新规格无法解析（旧=" + (a != null) + ", 新=" + (b != null) + "）";
 		}
+		com.mcai.common.spec.FreeformSpec fa = a.freeform;
+		com.mcai.common.spec.FreeformSpec fb = b.freeform;
 		StringBuilder sb = new StringBuilder();
-		if (!String.valueOf(a.archetype).equals(String.valueOf(b.archetype))) {
-			sb.append("archetype: ").append(a.archetype).append("→").append(b.archetype).append("; ");
+		if (!String.valueOf(fa.size).equals(String.valueOf(fb.size))) {
+			sb.append("size: ").append(fa.size).append("→").append(fb.size).append("; ");
 		}
-		if (!String.valueOf(a.floors).equals(String.valueOf(b.floors))) {
-			sb.append("floors: ").append(a.floors).append("→").append(b.floors).append("; ");
+		if (!String.valueOf(fa.mirror).equals(String.valueOf(fb.mirror))) {
+			sb.append("mirror: ").append(fa.mirror).append("→").append(fb.mirror).append("; ");
 		}
-		if (!String.valueOf(a.layerHeight).equals(String.valueOf(b.layerHeight))) {
-			sb.append("layer_height: ").append(a.layerHeight).append("→").append(b.layerHeight).append("; ");
+		if (fa.ops.size() != fb.ops.size()) {
+			sb.append("ops 数量: ").append(fa.ops.size()).append("→").append(fb.ops.size()).append("; ");
 		}
-		if (!String.valueOf(a.size).equals(String.valueOf(b.size))) {
-			sb.append("size: ").append(a.size).append("→").append(b.size).append("; ");
+		if (!freeformSignature(fa).equals(freeformSignature(fb))) {
+			sb.append("ops 内容有变化; ");
 		}
-		if (a.rooms.size() != b.rooms.size()) {
-			sb.append("rooms 数量: ").append(a.rooms.size()).append("→").append(b.rooms.size()).append("; ");
-		} else {
-			for (int i = 0; i < a.rooms.size(); i++) {
-				BuildingSpec.RoomSpec ra = a.rooms.get(i);
-				BuildingSpec.RoomSpec rb = b.rooms.get(i);
-				if (!ra.type.equals(rb.type) || ra.x != rb.x || ra.z != rb.z || ra.w != rb.w || ra.d != rb.d) {
-					sb.append("房间[").append(i).append("]: ").append(ra.type).append(" ").append(ra.w).append("x")
-							.append(ra.d).append("@").append(ra.x).append(",").append(ra.z).append(" → ")
-							.append(rb.type).append(" ").append(rb.w).append("x").append(rb.d).append("@")
-							.append(rb.x).append(",").append(rb.z).append("; ");
-					break;
-				}
-			}
+		if (!String.valueOf(fa.palette).equals(String.valueOf(fb.palette))) {
+			sb.append("palette 有变化; ");
 		}
-		if (!String.valueOf(a.features).equals(String.valueOf(b.features))) {
-			sb.append("features: ").append(a.features).append("→").append(b.features).append("; ");
-		}
-		if (!String.valueOf(a.materials).equals(String.valueOf(b.materials))) {
-			sb.append("materials 有变化; ");
-		}
-		if (!String.valueOf(a.roof != null ? a.roof.style : null)
-				.equals(String.valueOf(b.roof != null ? b.roof.style : null))) {
-			sb.append("roof.style: ").append(a.roof != null ? a.roof.style : null).append("→")
-					.append(b.roof != null ? b.roof.style : null).append("; ");
-		}
-		if (!String.valueOf(a.notes).equals(String.valueOf(b.notes))) {
-			sb.append("notes 有变化（程序暂不解析 notes 内容）; ");
+		if (!String.valueOf(fa.notes).equals(String.valueOf(fb.notes))) {
+			sb.append("notes 有变化; ");
 		}
 		return sb.length() == 0 ? "无变化（模型原样返回了上一次的规格）" : sb.toString();
 	}
 
-	/** 结果已被查看（打开面板），悬浮球隐藏；方案数据保留供"调整上次方案"使用 */
+	/** 结果已被查看（打开面板），悬浮球隐藏；方案数据保留供"调整"使用 */
 	public void acknowledge() {
 		freshResult = false;
 		if (phase == Phase.SUCCESS || phase == Phase.FAILED) {
 			phase = Phase.IDLE;
 		}
-	}
-
-	/** 从玩家描述提取明确楼层数（如"20 层"、"至少 15 层"、"层数 8"）；没有则 null */
-	private static Integer extractFloorHint(String description) {
-		if (description == null) {
-			return null;
-		}
-		Matcher m = Pattern.compile("(\\d+)\\s*(?:楼)?层|层(?:数)?\\s*(?:为|=)?\\s*(\\d+)").matcher(description);
-		if (m.find()) {
-			String v = m.group(1) != null ? m.group(1) : m.group(2);
-			if (v != null) {
-				return Integer.parseInt(v);
-			}
-		}
-		return null;
 	}
 
 	// ==================== 悬浮球（MC 像素风格） ====================
@@ -262,7 +539,6 @@ public class BuildTaskManager {
 			"..XXXX..",
 	};
 
-	/** 右上角悬浮球：生成中金色+呼吸+秒数；完成绿色闪"!"；失败红色"X"。点击打开面板 */
 	public static void renderBall(net.minecraft.client.gui.GuiGraphicsExtractor g) {
 		Minecraft client = Minecraft.getInstance();
 		if (client.screen != null || client.player == null) {

@@ -16,7 +16,7 @@ import net.minecraft.network.chat.Component;
  */
 public class AiConfigScreen extends Screen {
 	private static final int PANEL_W = 380;
-	private static final int PANEL_H = 240;
+	private int panelX, panelY, panelH;
 
 	private final AiConfig config;
 	private EditBox baseUrlField;
@@ -24,6 +24,7 @@ public class AiConfigScreen extends Screen {
 	private EditBox apiKeyField;
 	private EditBox ollamaUrlField;
 	private EditBox ollamaModelField;
+	private EditBox idleTimeoutField;
 	private Button providerOaiButton;
 	private Button providerOllamaButton;
 	private Button thinkingButton;
@@ -40,10 +41,9 @@ public class AiConfigScreen extends Screen {
 
 	@Override
 	protected void init() {
-		int cx = this.width / 2;
-		int cy = this.height / 2;
-		int x0 = cx - PANEL_W / 2;
-		int y0 = cy - PANEL_H / 2;
+		layoutPanel();
+		int x0 = panelX;
+		int y0 = panelY;
 
 		providerOaiButton = Button.builder(Component.literal(""), b -> {
 			useOllama = false;
@@ -96,18 +96,30 @@ public class AiConfigScreen extends Screen {
 		ollamaModelField.setHint(Component.literal("选择本地 Ollama 后端时使用"));
 		addRenderableWidget(ollamaModelField);
 
+		idleTimeoutField = new EditBox(this.font, x0 + 10 + labelW, fieldY + 100, fieldW, 18, Component.literal("空闲超时(秒)"));
+		idleTimeoutField.setMaxLength(6);
+		idleTimeoutField.setValue(String.valueOf(Math.max(10, config.idleTimeoutSeconds)));
+		idleTimeoutField.setHint(Component.literal("流式响应无数据超过该秒数则断开，默认 45"));
+		addRenderableWidget(idleTimeoutField);
+
 		Button saveButton = Button.builder(Component.literal("保存"),
 				b -> saveConfig())
-				.bounds(x0 + 10, y0 + PANEL_H - 26, 80, 20)
+				.bounds(x0 + 10, y0 + panelH - 26, 80, 20)
 				.build();
 		Button backButton = Button.builder(Component.literal("返回"),
 				b -> this.onClose())
-				.bounds(x0 + 100, y0 + PANEL_H - 26, 80, 20)
+				.bounds(x0 + 100, y0 + panelH - 26, 80, 20)
 				.build();
 		addRenderableWidget(saveButton);
 		addRenderableWidget(backButton);
 
 		refreshButtons();
+	}
+
+	private void layoutPanel() {
+		panelH = Math.min(280, this.height - 16);
+		panelX = (this.width - PANEL_W) / 2;
+		panelY = (this.height - panelH) / 2;
 	}
 
 	private void refreshButtons() {
@@ -126,6 +138,12 @@ public class AiConfigScreen extends Screen {
 		config.ollamaUrl = ollamaUrlField.getValue().trim();
 		config.ollamaModel = ollamaModelField.getValue().trim();
 		config.thinkingEnabled = thinkingEnabled;
+		try {
+			int idleSec = Integer.parseInt(idleTimeoutField.getValue().trim());
+			config.idleTimeoutSeconds = Math.max(10, Math.min(600, idleSec));
+		} catch (NumberFormatException e) {
+			status = "空闲超时秒数无效，保持原值";
+		}
 		if (config.openaiModel.isEmpty()) {
 			status = "模型名不能为空，未保存";
 			return;
@@ -139,27 +157,27 @@ public class AiConfigScreen extends Screen {
 
 	@Override
 	public void extractRenderState(GuiGraphicsExtractor context, int mouseX, int mouseY, float delta) {
-		int cx = this.width / 2;
-		int cy = this.height / 2;
-		int x0 = cx - PANEL_W / 2;
-		int y0 = cy - PANEL_H / 2;
+		layoutPanel();
+		int x0 = panelX;
+		int y0 = panelY;
 
-		context.fill(x0 - 4, y0 - 4, x0 + PANEL_W + 4, y0 + PANEL_H + 4, 0xC0101010);
-		context.fill(x0, y0, x0 + PANEL_W, y0 + PANEL_H, 0xE62A2F38);
-		context.fill(x0 + 8, y0 + 152, x0 + PANEL_W - 8, y0 + 172, 0xB0000000);
+		context.fill(x0 - 4, y0 - 4, x0 + PANEL_W + 4, y0 + panelH + 4, 0xC0101010);
+		context.fill(x0, y0, x0 + PANEL_W, y0 + panelH, 0xE62A2F38);
+		context.fill(x0 + 8, y0 + panelH - 54, x0 + PANEL_W - 8, y0 + panelH - 30, 0xB0000000);
 
 		super.extractRenderState(context, mouseX, mouseY, delta);
 
-		context.centeredText(this.font, "AI 配置", cx, y0 + 4, 0xFFFFFFFF);
+		context.centeredText(this.font, "AI 配置", x0 + PANEL_W / 2, y0 + 4, 0xFFFFFFFF);
 		int fieldY = y0 + 52;
 		context.text(this.font, "Base URL：", x0 + 12, fieldY + 3, 0xFFC0C0C0);
 		context.text(this.font, "模型名：", x0 + 12, fieldY + 23, 0xFFC0C0C0);
 		context.text(this.font, "API Key：", x0 + 12, fieldY + 43, 0xFFC0C0C0);
 		context.text(this.font, "Ollama 地址：", x0 + 12, fieldY + 63, 0xFFC0C0C0);
 		context.text(this.font, "Ollama 模型：", x0 + 12, fieldY + 83, 0xFFC0C0C0);
+		context.text(this.font, "空闲超时(秒)：", x0 + 12, fieldY + 103, 0xFFC0C0C0);
 		String info = "当前生效：" + (useOllama ? config.ollamaModel : config.openaiModel)
 				+ "（思考" + (thinkingEnabled ? "开" : "关") + "）";
-		context.text(this.font, info, x0 + 12, y0 + 156, 0xFFC0C0C0);
-		context.text(this.font, status, x0 + 12, y0 + 166, status.isEmpty() ? 0xFFC0C0C0 : 0xFF66FF66);
+		context.text(this.font, info, x0 + 12, y0 + panelH - 50, 0xFFC0C0C0);
+		context.text(this.font, status, x0 + 12, y0 + panelH - 38, status.isEmpty() ? 0xFFC0C0C0 : 0xFF66FF66);
 	}
 }

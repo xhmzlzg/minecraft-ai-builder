@@ -29,6 +29,24 @@ public class AiConfig {
 	/** 思考模式（推理模型开启后质量更高但更慢）；默认开启 */
 	public boolean thinkingEnabled = true;
 
+	/**
+	 * 流式响应空闲超时（秒）。HttpRequest.timeout 只保护到响应头，
+	 * 响应体阶段靠这个值：超过这么久没收到任何数据就断开。
+	 */
+	public int idleTimeoutSeconds = 45;
+
+	/**
+	 * 生成总时长上限（秒）。两阶段：设计要点 + 绘制 ops。
+	 * 默认 480：要留思考时间；空闲超时另算。
+	 */
+	public int maxGenerateSeconds = 480;
+
+	/** 阶段一「设计要点」总时长上限（秒） */
+	public int designBriefSeconds = 90;
+
+	/** 思考预算（秒）：仅在【开启思考】时生效；关思考后模型若仍吐 reasoning 会一直等正文。 */
+	public int thinkingBudgetSeconds = 240;
+
 	public String modelName() {
 		if ("openai".equals(provider)) {
 			return openaiModel;

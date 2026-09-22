@@ -1,6 +1,7 @@
 package com.mcai.common;
 
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -84,6 +85,11 @@ public class BuildingExecutor {
 		List<BlockPos> positions = new ArrayList<>();
 		List<BlockState> oldStates = new ArrayList<>();
 		int placed = 0;
+		// v1.1.1：默认由 AI 自己挑方块之后，它偶尔会写出不存在的方块 id。
+		// 这类格子会被静默跳过（方案里有、世界里没有，预览和实际对不上），
+		// 所以这里统计出来并写日志，方便一眼看出"AI 写了什么不存在的方块"。
+		int skipped = 0;
+		Map<String, Integer> unknown = new LinkedHashMap<>();
 		for (BuildingPlan.Entry e : plan.entries) {
 			BlockPos pos = origin.offset(e.x(), e.y(), e.z());
 			if (!world.isInWorldBounds(pos)) {
@@ -109,6 +115,10 @@ public class BuildingExecutor {
 			}
 			Block block = resolveBlock(baseId);
 			if (block == Blocks.AIR) {
+				if (!"air".equals(baseId) && !"cave_air".equals(baseId) && !"void_air".equals(baseId)) {
+					skipped++;
+					unknown.merge(baseId, 1, Integer::sum);
+				}
 				continue;
 			}
 			BlockState state = block.defaultBlockState();
@@ -146,6 +156,18 @@ public class BuildingExecutor {
 			undoStack.add(new UndoData(world.dimension(), origin, positions, oldStates));
 		}
 		MinecraftAIMod.LOGGER.info("[Minecraft AI] 建造完成: {} ({} 个方块)", plan.name, placed);
+		if (skipped > 0) {
+			StringBuilder sb = new StringBuilder();
+			int shown = 0;
+			for (Map.Entry<String, Integer> en : unknown.entrySet()) {
+				if (shown++ >= 8) {
+					sb.append("…");
+					break;
+				}
+				sb.append(en.getKey()).append("×").append(en.getValue()).append(' ');
+			}
+			MinecraftAIMod.LOGGER.warn("[Minecraft AI] 有 {} 个方块 id 不存在，已跳过：{}", skipped, sb.toString().trim());
+		}
 		return placed;
 	}
 

@@ -1,15 +1,24 @@
 package com.mcai.client.ai;
 
+import java.io.BufferedReader;
+import java.io.IOException;
+import java.io.InputStream;
+import java.io.InputStreamReader;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
 
 import com.google.gson.JsonArray;
+import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 
@@ -19,149 +28,364 @@ import com.mcai.common.AiConfig;
 /**
  * AI 后端客户端：支持本地 Ollama 与任意 OpenAI 兼容 API（OpenRouter / DeepSeek 官方等）。
  * 在后台线程执行，不阻塞游戏主线程。
+ *
+ * v1.1.1 起改为【流式 stream:true + 空闲超时】：
+ * - HttpRequest.timeout() 只保护到响应头，响应体阶段靠「多久没收到数据」判定卡死；
+ * - 同时捕获思考流（reasoning / thinking），供界面折叠展示；
+ * - 正文仍只用 content / message.content，绝不把半截思考当成品规格。
  */
 public class AiClient {
-	private static final String SYSTEM_PROMPT = """
-			你是 Minecraft 建筑设计师。玩家用一句话描述想要的建筑，你来设计并画出每层楼的平面蓝图（字符画），输出 JSON。
 
-			字符含义：
-			# = 墙（主墙材质）
-			W = 窗（玻璃+窗框）
-			D = 门（门洞）
-			P = 装饰柱（强调材质）
-			S = 楼梯井/电梯井（程序自动生成脚手架柱贯穿全楼）
-			. = 室内地板
-			R = 床  B = 书柜  C = 工作台/柜台  F = 熔炉/灶台  L = 灯笼  T = 花盆  X = 海晶灯
+	/** 一次 AI 回复：正文 JSON + 思考过程（可为空）。 */
+	public static final class AiReply {
+		public final String content;
+		public final String thinking;
 
-			JSON 格式（只输出 JSON，禁止任何其他文字，不要代码块）：
-			{
-			  "name": "建筑名",
-			  "floors": 层数,
-			  "layer_height": 层高（格）,
-			  "wall": "主墙方块id",
-			  "accent": "强调方块id",
-			  "roof": "flat 或 pyramid 或 gabled",
-			  "interiors": true,
-			  "floors_map": {
-			    "1": ["首层蓝图", ...],
-			    "2": ["标准层蓝图", ...],
-			    "top": ["顶层蓝图", ...]
-			  }
-			}
+		public AiReply(String content, String thinking) {
+			this.content = content == null ? "" : content;
+			this.thinking = thinking == null ? "" : thinking;
+		}
+	}
 
-			layer_height：玩家描述里提到层高（如"层高5格"）就严格照做；没提到就自主决定 3~5（普通住宅 3、大堂/教堂/城堡 5）
+	/** 流式进度回调：思考增量会实时推给界面。 */
+	public interface StreamListener {
+		void onThinking(String delta);
 
-			floors_map 模板规则（重要！）：
-			- "floors" 必须严格等于玩家要求的层数！玩家说 20 层就是 20，说 3 层就是 3，绝不擅自增减
-			- 蓝图是模板不是楼层清单：只画 2~4 张图，"1" 首层、"2" 标准层、"top" 顶层（顶层和标准层一样就省略 top）
-			- 程序会把 "2" 的标准层自动复制到所有中间楼层，楼层数只写进 floors 字段，蓝图张数与楼层数无关！
-			- 20 层高楼和 3 层小楼都只需 2~3 张蓝图，严禁每层单独画图、严禁超过 4 张图
-			- 只有某一层特别（如 3 层是露台）才补一张，key 写 "3"
-			- "top" 顶层可以有天台/瞭望/花园特色
-
-			蓝图绘制规则：
-			1. 每行是一个字符串，第一行是南面外墙；所有行必须等长（宽度 8~24），行数 = 进深（8~24）
-			2. 外墙以 # 为主墙，每面外墙开 2~4 个 W 窗（间距均匀）和 1~2 个 D 门，窗门交替排列，外墙不能全是窗
-			3. 室内用 # 内墙把空间分隔成多个房间/户型，每户必须有：D 门、R 床、C 桌、F 灶、T 卫、L 灯
-			4. 住宅每户：卧室 R、客厅 C、厨房 F、卫生间 T、门口 D、窗 W、室内灯 L 都要画
-			5. 一楼每个单元必须有入口 D；层数多时楼梯井/电梯井用 S 画在每层同一位置
-			6. 玩家提到庭院/花园/水池时，用 T/L/P 和 . 在第一层蓝图里画出院落布置
-			7. 顶层"top"蓝图可以比其他层多画一行，这一行生成在屋顶表面（实心屋顶之上）作为屋顶装饰：'P' 避雷针/天线柱、'X' 海晶灯、'L' 灯笼；不画也行，程序会自动铺实心平顶。注意：屋顶本身永远是实心封顶，绝不能有玻璃、天窗或空隙
-			8. 外墙避免单调：W 窗和 P 柱交错，窗要有规律
-			9. 可用方块：white_concrete、light_gray_concrete、stone_bricks、cobblestone、oak_planks、dark_oak_planks、spruce_planks、terracotta、red_terracotta、oak_log、dark_oak_log、spruce_log、glass_pane、oak_door、dark_oak_stairs、red_wool、lantern、sea_lantern、flower_pot、bookshelf、crafting_table、chest、furnace、red_bed、dark_oak_fence、oak_fence_gate、scaffolding
-
-			设计要点：
-			1. 认真理解玩家描述：几层、河边/海景、院子、阳台、塔楼、飘窗、风格、颜色都要画进蓝图
-			2. 中式建筑用深色木材(dark_oak_planks)+红色点缀(red_terracotta)；现代用混凝土(white_concrete)+浅灰；城堡用石砖(stone_bricks)；海边度假屋用浅色木+白色
-			3. 描述说"精美/气派/豪华"时，多用 P 柱子、W 大窗、L 灯笼、T 花草，布局讲究对称
-			4. 建筑要精致有设计感：门廊、柱廊、露台、错落的天台，绝不要只画一个空盒子
-			5. 室内房间要分隔：用 # 做内墙，分出客厅/卧室/厨房/卫生间等区域
-			""";
+		void onContent(String delta);
+	}
 
 	/**
-	 * v1.1.0 新契约：AI 输出"设计规格 JSON"（DSL），由 SpecBuilder 参数化展开成方块。
-	 * 相比旧版字符画蓝图（8~24 格、13 个字符），规格可以表达层高、户型、房间、
-	 * 材质、屋顶构件、楼梯电梯等细节，而且输出很短 —— 细节不再被输出长度挤掉。
+	 * 唯一契约：AI 输出【自由形体规格 JSON】（ops 绘制指令），由游戏内程序逐格照做。
+	 * 形状完全由 AI 的 ops 决定，程序不提供任何建筑模板。
 	 */
 	private static final String SYSTEM_PROMPT_V2 = """
-			你是 Minecraft 建筑设计师兼规格工程师。玩家描述想要的建筑，你输出【设计规格 JSON】，
-			由游戏内的参数化构件库确定性地展开成方块（门窗、家具、楼梯、电梯、屋面都由程序按规格生成）。
+			你是 Minecraft 建造设计师。玩家描述想要的东西，**你亲手把它一格一格画出来**：
+			输出【自由形体规格 JSON】（ops 绘制指令），由游戏内的程序照做放方块。
+			程序不提供任何建筑模板 —— 形状完全由你的 ops 决定。
 
 			只输出 JSON，禁止任何解释文字，禁止代码块。
 
-			JSON 结构（除 name 外都可省略，程序会补合理默认值）：
+			★★ 唯一契约：kind="freeform" ★★
+			房子、别墅、四合院、城堡、塔、庙、教堂、商店、商场、学校、写字楼、车库、
+			桥、船、飞机、汽车、雕像、树、家具……**一切**都用 kind="freeform"，
+			用 ops 亲手画出它的外形与内部。
+			★ 本模组曾经有过 kind="building"（archetype 参数化建筑模板），现已**全部删除**：
+			  写它程序一格方块都盖不出来。所以**不要写 kind="building"、不要写 archetype** ——
+			  哪怕玩家点名要"标准住宅楼 / 公寓楼"，也要你自己用 ops 把户型、楼梯、电梯画出来。
+
+			======= 契约：自由形体（kind="freeform"）=======
 			{
-			  "spec_version": 2,
-			  "name": "建筑名",
-			  "archetype": "chinese_highrise|chinese_courtyard|modern_villa|castle|generic",
-			  "floors": 层数,
-			  "layer_height": 层高(3~8，住宅默认4 = 1格楼板 + 3格净高),
-			  "size": [宽, 进深],
-			  "features": ["stairs","elevator","balcony","roof_equipment","parapet","garden","no_ac"],
-			  "materials": {"wall":"方块id","accent":"方块id","glass":"方块id","frame":"方块id",
-			                "base":"方块id","floor_living":"方块id","floor_wet":"方块id","roof":"方块id"},
-			  "rooms": [{"type":"living","x":0,"z":0,"w":6,"d":5}],
-			  "roof": {"style":"flat|pyramid|gabled","parapet":true,"water_tank":true,"solar":true,"garden":false},
+			  "spec_version": 3,
+			  "kind": "freeform",
+			  "name": "作品名",
+			  "size": [宽X, 高Y, 进深Z],
+			  "palette": {"h":"dark_oak_planks","d":"spruce_planks","m":"oak_log","s":"white_wool"},
+			  "mirror": "x",
+			  "ops": [ ... ],
 			  "notes": "玩家提到的其它细节"
 			}
+			- size：可选。给了就按它定外框；不给就按 ops 的实际范围自动算。
+			- palette：单字符 → 方块 id。不写的话可用内置字符表（见下）。
+			- mirror：可选 none(默认) / x / z / xz。★强烈建议用★ ——
+			  开了以后 ops 只需要画"一半"（x 小于 宽/2 的那半），程序自动镜像出另一半，
+			  输出量减半、左右绝对对称，程序还会把朝向/铰链/楼梯形状一起翻好。
+			- ops：按顺序执行，后面的覆盖前面的。坐标从 0 开始，x = 东西、y = 上下、z = 南北，y=0 是底部（贴地）。
 
-			房间 type 只能取：living(客厅) master(主卧) bed2/bed3(次卧) kitchen(厨房) bath(卫生间)
-			dining(餐厅) entry(玄关) hall(走道) balcony(阳台) study(书房) storage(储物)
-			stairs(楼梯间) lobby(候梯厅) courtyard(庭院) pool(水池) garden(花园)
-			每个房间会自动配家具：客厅沙发电视茶几、主卧双人床+衣柜、厨房灶台抽油烟机水槽冰箱、
-			卫生间马桶洗手台淋浴、餐厅餐桌椅、玄关鞋柜、阳台晾衣杆+洗衣机、书房书桌书柜。
+			ops 支持 5 种：
+			1. {"op":"layer","y":0,"rows":["..hhh..",".hhhhh."]}
+			   单层字符画：rows[z] 的第 x 个字符决定该格方块。'.' 或空格 = 不放置。
+			   ★这是画外形的主力，尽量用它画轮廓★
+			2. {"op":"box","from":[x,y,z],"to":[x,y,z],"block":"stone_bricks","hollow":false}
+			   长方体（两个对角点）；hollow=true 只做六面外壳。
+			   ★大面积平面 / 墙体 / 楼板都用它，比一层层写 layer 省事得多★
+			3. {"op":"cyl","x":5,"z":5,"r":3,"y0":0,"y1":6,"block":"oak_log","hollow":false}
+			   竖直圆柱（柱子、烟囱、树干）；可用 rx / rz 分别给两个方向的半径。
+			4. {"op":"sphere","x":5,"y":10,"z":5,"r":4,"block":"white_wool","hollow":true}
+			   球/椭球（气球、圆顶、头）；可用 rx / ry / rz。
+			5. {"op":"clear","from":[x,y,z],"to":[x,y,z]}   掏空一个长方体（船舱、门洞、窗户、室内空间）。
 
-			硬性规则：
-			1. floors 必须严格等于玩家说的层数；没说就按原型默认（中式高层8、别墅2、城堡3）。
-			2. archetype 判断：中国城市住宅楼/公寓/居民楼 → chinese_highrise；中式院落/四合院 → chinese_courtyard；
-			   别墅/现代住宅 → modern_villa；城堡/要塞 → castle；其它 → generic。
-			3. chinese_highrise 由程序自动生成"一梯两户 + 双跑楼梯 + 脚手架电梯井 + 候梯厅"，
-			   你不必也无法用房间表描述核心筒，只需让 features 含 stairs 和 elevator。
-			4. 屋顶必须封顶（程序自动铺平屋面 + 女儿墙），可用 roof.style 选 flat/pyramid/gabled。
-			5. 窗由程序按房间类型自动开（客厅卧室大窗、厨卫小高窗），不要试图自己排窗。
-			6. size 一般省略（用玩家框选的范围）；只有玩家明确要求尺寸时才填。房间表同理，只有自定义户型时才给。
-			7. materials 只填确实要指定的项，其余省略用原型默认。
-			8. notes 写玩家提到的其它细节（颜色、风格、特殊要求），程序会尽量落实。
-			9. 被要求"按意见调整"时：你会看到自己上一次的规格 JSON 和玩家的修改意见，
-			   请输出【完整的新规格 JSON】（结构完全一致），只改需要改的字段，其余原样保留。
-			10. 调整时必须真的改动字段：玩家说"改户型/加房间/换材质/加层/换屋顶/封阳台"，
-			    就改 rooms / materials / floors / roof / features 里对应的值；rooms 对 chinese_highrise 同样生效
-			    （表示"一户"的布局，程序会按朝向镜像到另一户）。
-			11. 门、门楣、开门按钮/压力板、灯笼、光照、屋顶封顶这些由程序保证，不需要你写进规格。
-			12. 严禁原样返回上一次的规格：如果实在无法表达，就把要求写进 notes，并至少调整一个相关字段。
+			ops 的可选 props（blockstate 属性）—— 用来画楼梯朝向、半砖、栅栏门、挂灯、横梁原木：
+			{"op":"box","from":[1,1,5],"to":[1,1,5],"block":"dark_oak_stairs",
+			 "props":{"facing":"north","half":"bottom"}}
+			常用属性：facing(north/south/east/west) · half(top/bottom) · type(top/bottom/double，半砖)
+			          axis(x/y/z，原木/柱子/锁链) · hinge(left/right，门) · open(true/false，栅栏门/活板门)
+			          shape(straight/inner_left/inner_right/outer_left/outer_right，楼梯) · hanging(true/false，灯笼)
+			· 不写 props 时程序会自动补：栏杆/玻璃板/铁栏杆自动连成一片；灯笼上方是实心块就自动变成吊灯。
+			· mirror 时程序会自动翻转 facing/hinge/shape/rotation，你不用管镜像后的朝向。
+			· block 直接写成原版带状态的形式（"oak_stairs[facing=east]"）或带 minecraft: 前缀，程序一样认；
+			  但镜像时用 props 分开写更可靠。
+
+			内置字符表（不写 palette 时可用）：
+			# 石砖  O 橡木板  o 橡木原木  T 深色橡木板  t 深色橡木原木  P 云杉木板  p 云杉原木
+			S 石头  I 铁块  G 玻璃  W 白色羊毛  B 蓝色羊毛  R 红色羊毛  Y 黄色羊毛  E 灰色羊毛  K 黑色羊毛
+			L 灯笼  X 海晶灯
+
+			自由形体硬性规则：
+			0. **输出要紧凑**（省 token = 更快出结果）：
+			   - ops 总数尽量 ≤25（能一个 box 解决的绝不用十个）
+			   - **优先 box / cyl / sphere**，layer 只用来画轮廓剪影
+			   - 尺寸尽量 ≤32；能 mirror 就 mirror，只画一半
+			   - palette 3~6 种材质
+			1. 尺寸别超过 48 格（长/宽/高任一边）；正常作品 8~30 格就很漂亮。
+			2. 从下往上画：y=0 先画船底/地基/底盘/底座，再往上堆甲板、桅杆、帆、楼层。
+			3. 外形必须有辨识度 —— 只画一个方盒子是失败的：
+			   - 船：尖船头（前几层用 '.' 收窄成尖角）+ 弧形船底 + 平整甲板 + 桅杆 + 船帆（白羊毛）+ 船尾楼
+			   - 飞机：细长机身 + 左右机翼 + 尾翼 + 驾驶舱玻璃
+			   - 汽车：底盘 + 车身 + 车顶 + 车轮（黑羊毛）
+			   - 雕像：头 / 身体 / 四肢分段，姿态要看得出来
+			   - 桥：桥面 + 两侧栏杆 + 桥墩
+			   - 房子：地基 → 四面墙 → 楼板 → 上层墙 → 屋顶 → 掏门窗 → 室内楼梯与家具（见示例 2）
+			4. 不要给非建筑物体加"房间、门、窗、屋顶"那套建筑逻辑；它是物体，不是房子。
+			5. mirror 的写法要点：开了 mirror="x" 后，layer 的每一行**只写左半边**（长度 ≈ 宽/2），
+			   程序会把右半边镜像出来；各行长度可以不一样（短行 = 该处收窄，船头船尾就是这么收尖的）。
+			   rows 的行数 = 进深（第 0 行在 z=0），rows 越多船越长。
+			   用 mirror 时最好同时写 size，其中 宽 = 每行字符数 × 2 - 1（例：每行 8 个字符 → 宽 15）；
+			   不写 size 程序也会按这个规则推断，但显式写更保险。
+			6. 细长部件（桅杆、旗杆、烟囱、柱子、天线）直接用 box 从 (x,y0,z) 到 (x,y1,z) 画一条线，
+			   别用 cyl 去凑；大面积的平面（帆、甲板、机翼、楼板）也用 box。
+			7. 控制输出长度：一艘船 10~15 个 op 够了，一栋 2 层小屋 20~30 个 op 够了。
+			   能用一个 box 解决的，绝不用十个 box。
+			8. palette 里出现的每个字符都必须在 palette 里定义（区分大小写），否则那些格子会被跳过；
+			   坐标从 0 开始、且必须小于 size，越界的格子会被丢弃。
+			   这两条是最容易让"整件作品变成 0 个方块"的原因。
+
+			示例 1（一艘 15×11×7 的帆船。注意：mirror=x 时每行只写左半边 8 个字符 = x 0~7，
+			rows[0] 是船头方向 z=0，rows 有几行就是进深几格）：
+			{"spec_version":3,"kind":"freeform","name":"帆船","size":[15,11,7],"mirror":"x",
+			 "palette":{"h":"dark_oak_planks","d":"spruce_planks","m":"oak_log","s":"white_wool"},
+			 "ops":[
+			  {"op":"layer","y":0,"rows":["......hh",".....hhh","....hhhh","...hhhhh","....hhhh",".....hhh","......hh"]},
+			  {"op":"layer","y":1,"rows":[".....hhh","....hhhh","...hhhhh","..hhhhhh","...hhhhh","....hhhh",".....hhh"]},
+			  {"op":"layer","y":2,"rows":["......dd",".....ddd","....dddd","...ddddd","....dddd",".....ddd","......dd"]},
+			  {"op":"box","from":[4,4,1],"to":[7,7,4],"block":"s"},
+			  {"op":"box","from":[7,2,3],"to":[7,9,3],"block":"m"}]}
+			这艘船的样子：y=0/y=1 是两头收尖的船体，y=2 是甲板，y=4~7 是一整片方帆（box 一次搞定），
+			y=2~9 的桅杆用 box 从下到上一条直线（细长部件用 box 最不容易写错，别用 cyl 去凑）。
+
+			示例 2（一栋 9×9×7 的两层木屋 —— "用 freeform 画房子"的标准套路：
+			地基 → 四壁 → 楼板 → 上层四壁 → 屋顶 → 掏门窗 → 室内楼梯）：
+			{"spec_version":3,"kind":"freeform","name":"两层木屋","size":[9,9,7],
+			 "palette":{"w":"oak_planks","s":"cobblestone","g":"glass_pane","d":"dark_oak_door","r":"dark_oak_stairs"},
+			 "ops":[
+			  {"op":"box","from":[0,0,0],"to":[8,0,6],"block":"s"},
+			  {"op":"box","from":[0,1,0],"to":[8,3,0],"block":"w"},
+			  {"op":"box","from":[0,1,6],"to":[8,3,6],"block":"w"},
+			  {"op":"box","from":[0,1,1],"to":[0,3,5],"block":"w"},
+			  {"op":"box","from":[8,1,1],"to":[8,3,5],"block":"w"},
+			  {"op":"box","from":[0,4,0],"to":[8,4,6],"block":"w"},
+			  {"op":"box","from":[0,5,0],"to":[8,7,0],"block":"w"},
+			  {"op":"box","from":[0,5,6],"to":[8,7,6],"block":"w"},
+			  {"op":"box","from":[0,5,1],"to":[0,7,5],"block":"w"},
+			  {"op":"box","from":[8,5,1],"to":[8,7,5],"block":"w"},
+			  {"op":"box","from":[0,8,0],"to":[8,8,6],"block":"s"},
+			  {"op":"box","from":[4,1,0],"to":[4,2,0],"block":"d","props":{"facing":"south"}},
+			  {"op":"box","from":[2,2,0],"to":[3,2,0],"block":"g"},
+			  {"op":"box","from":[6,2,0],"to":[7,2,0],"block":"g"},
+			  {"op":"box","from":[1,1,3],"to":[1,1,5],"block":"w"},
+			  {"op":"box","from":[1,2,3],"to":[1,2,4],"block":"w"},
+			  {"op":"box","from":[1,3,3],"to":[1,3,3],"block":"w"},
+			  {"op":"box","from":[1,1,6],"to":[1,1,6],"block":"r","props":{"facing":"north","half":"bottom"}},
+			  {"op":"box","from":[1,2,5],"to":[1,2,5],"block":"r","props":{"facing":"north","half":"bottom"}},
+			  {"op":"box","from":[1,3,4],"to":[1,3,4],"block":"r","props":{"facing":"north","half":"bottom"}},
+			  {"op":"box","from":[1,4,3],"to":[1,4,3],"block":"r","props":{"facing":"north","half":"bottom"}}]}
+			这栋房子的要点：四面墙是 4 个 box，**不要**用 hollow=true 的 box 画墙
+			（hollow 会把地板和天花板一起填满）；门和窗直接用 box 盖在墙上（后面的 op 覆盖前面的）；
+			楼梯每前进一格抬高 1 格，下方必须有实心方块垫着（那 3 个 w 的 box 就是垫脚）。
+
+			======= 画房子（住宅 / 写字楼 / 别墅 / 商场…都适用）的套路 =======
+			见上面的示例 2：地基 → 四面墙（4 个 box）→ 楼板 → 上层墙 → 屋顶 → 掏门窗 → 室内楼梯。
+			要多层、要户型、要电梯井，全都由你自己用 ops 画：
+			· 楼板：每层一个 box 铺满（y = 层号 × 层高）
+			· 隔墙：每个房间 4 个 box（或 1 个 box 的墙面 + 用 clear 掏门洞）
+			· 楼梯：*_stairs 每前进一格抬高 1 格，下方用 box 垫实心；楼梯井上下贯通（用 clear 掏穿）
+			· 电梯井：四面围一圈墙 + 井道上下用 clear 掏穿 + 井里放 scaffolding 当轿厢
+			· 门窗：用 box 盖在墙上（后面的 op 覆盖前面的），门用 *_door + props{"facing":...}
+			★ 别指望程序给你补任何东西：房间、家具、门窗、楼梯、照明全在你的 ops 里。
+
+			======= 调整模式 =======
+			你会看到自己上一次的规格 JSON 和玩家的修改意见，请输出【完整的新规格 JSON】：
+			1. 只改需要改的字段，其余原样保留；结构必须与上一次一致（字段不能丢）。
+			2. 如果玩家说"这不是我要的 / 我要的是一艘船 / 你做成房子了"，
+			   就按新外形重画 ops（改 ops / size / palette / mirror）。
+			3. 玩家说"加层/改户型/加房间/换材质/封阳台"就改对应的 ops
+			   （加层 = 加一组 box + 楼板；改户型 = 改隔墙的 box；换材质 = 改 palette 或 block）。
+			4. 严禁原样返回上一次的规格：如果实在无法表达，就把要求写进 notes，并至少调整一个相关字段。
 			""";
+
+	/** 阶段一：只出【设计要点】，不画方块。刻意压短输出，让思考更快结束。 */
+	private static final String DESIGN_BRIEF_SYSTEM = """
+			你是 Minecraft 建筑设计师。根据玩家描述，先给出【设计要点 JSON】，**不要画方块、不要输出 ops**。
+			只输出 JSON，禁止任何解释文字，禁止代码块。
+
+			{
+			  "name": "作品名",
+			  "size": [宽X, 高Y, 进深Z],
+			  "mirror": "none 或 x 或 z 或 xz",
+			  "palette": {"h": "dark_oak_planks", "s": "white_wool"},
+			  "outline": "一句话外形轮廓（辨识度要高）",
+			  "parts": ["y=0~2:船底收尖用深色木板", "y=3:甲板", "y=4~7:方帆白羊毛+桅杆"],
+			  "avoid": "不要做成二层小楼/不要屋顶平台"
+			}
+
+			硬性要求：
+			1. size 尽量小而有辨识度：任一边 ≤32，正常 8~24 最好。
+			2. 能对称就写 mirror（x/z/xz），这样 ops 只画一半。
+			3. palette 只用 3~6 种材质，字符用单字母。
+			4. parts 按从下到上列 5~10 条，每条说清形状与材质，**不要逐格坐标**。
+			5. 外形必须像目标物体（船要尖船头，飞机要有机翼），不要方盒子。
+			6. 这一步**不要**输出 freeform/ops，只输出上面这份要点。
+			""";
+
+	/**
+	 * 阶段一：设计要点（短 JSON）。
+	 */
+	public static CompletableFuture<AiReply> askDesignBrief(String description, String posText, AiConfig cfg,
+			StreamListener listener) {
+		return CompletableFuture.supplyAsync(() -> {
+			CANCELLED.set(false);
+			String endpoint = cfg.chatEndpoint();
+			JsonObject body = new JsonObject();
+			body.addProperty("model", cfg.modelName());
+			body.addProperty("stream", true);
+			boolean useThinking = cfg.thinkingEnabled;
+			JsonObject thinkingObj = new JsonObject();
+			thinkingObj.addProperty("type", "enabled");
+
+			JsonArray messages = new JsonArray();
+			JsonObject system = new JsonObject();
+			system.addProperty("role", "system");
+			system.addProperty("content", DESIGN_BRIEF_SYSTEM);
+			messages.add(system);
+			JsonObject user = new JsonObject();
+			user.addProperty("role", "user");
+			user.addProperty("content", "在坐标 " + posText + " 建造：" + description
+					+ "\n请只输出设计要点 JSON。");
+			messages.add(user);
+			body.add("messages", messages);
+
+			final int maxAttempts = 3;
+			final int idleTimeoutMs = Math.max(10, cfg.idleTimeoutSeconds) * 1000;
+			final int briefTotalMs = Math.max(30, cfg.designBriefSeconds) * 1000;
+			final int thinkingBudgetMs = Math.max(15, cfg.thinkingBudgetSeconds) * 1000;
+			String lastReason = null;
+			for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+				applyThinkingFlags(body, thinkingObj, useThinking);
+				HttpRequest.Builder rb = HttpRequest.newBuilder()
+						.uri(URI.create(endpoint))
+						.timeout(Duration.ofSeconds(30))
+						.header("Content-Type", "application/json")
+						.header("Accept", "text/event-stream, application/json, application/x-ndjson")
+						.header("User-Agent", "minecraft-ai-mod")
+						.POST(HttpRequest.BodyPublishers.ofString(body.toString()));
+				if (!cfg.apiKey().isEmpty()) {
+					rb.header("Authorization", "Bearer " + cfg.apiKey());
+				}
+				try {
+					MinecraftAIMod.LOGGER.info("[Minecraft AI] 阶段1设计要点: model={} thinking={} (第 {} 次)",
+							cfg.modelName(), useThinking, attempt);
+					HttpResponse<InputStream> response = HTTP.send(rb.build(), HttpResponse.BodyHandlers.ofInputStream());
+					if (response.statusCode() != 200) {
+						String errBody = readAllQuietly(response.body());
+						lastReason = describeError(response.statusCode(), errBody);
+						if (attempt < maxAttempts && useThinking) {
+							useThinking = false;
+							continue;
+						}
+						throw new RuntimeException(lastReason);
+					}
+					return readStream(response.body(), cfg, listener, idleTimeoutMs, briefTotalMs, useThinking);
+				} catch (ThinkingBudgetException e) {
+					lastReason = e.getMessage();
+					if (attempt < maxAttempts && useThinking) {
+						useThinking = false;
+						MinecraftAIMod.LOGGER.warn("[Minecraft AI] 设计要点思考超预算，关思考重试");
+						continue;
+					}
+					throw new RuntimeException(lastReason, e);
+				} catch (CancelledException e) {
+					throw e;
+				} catch (Exception e) {
+					if (CANCELLED.get()) {
+						throw new CancelledException("已取消本次生成");
+					}
+					lastReason = e.getMessage() == null ? e.toString() : e.getMessage();
+					if (attempt < maxAttempts) {
+						sleepQuietly(800L * attempt);
+						continue;
+					}
+					throw new RuntimeException(lastReason, e);
+				}
+			}
+			throw new RuntimeException(lastReason == null ? "设计要点生成失败" : lastReason);
+		}, EXECUTOR);
+	}
+
+	/** 思考超预算（一直思考、正文为空）。 */
+	private static final class ThinkingBudgetException extends RuntimeException {
+		ThinkingBudgetException(String msg) {
+			super(msg);
+		}
+	}
 
 	private static final HttpClient HTTP = HttpClient.newBuilder()
 			.connectTimeout(Duration.ofSeconds(5))
 			.build();
 
-	private static final ExecutorService EXECUTOR = Executors.newFixedThreadPool(2, r -> {
+	private static final ExecutorService EXECUTOR = Executors.newCachedThreadPool(r -> {
 		Thread t = new Thread(r, "minecraft-ai-request");
 		t.setDaemon(true);
 		return t;
 	});
 
-	/**
-	 * 异步请求 AI 生成建筑方案，返回 AI 的原始文本回复。
-	 */
-	public static CompletableFuture<String> askPlan(String description, String posText, AiConfig cfg) {
-		return askPlan(description, posText, cfg, null, null);
+	/** 当前进行中的流式请求的中断标记（取消用）。 */
+	private static final AtomicReference<InputStream> ACTIVE_STREAM = new AtomicReference<>();
+	private static final AtomicBoolean CANCELLED = new AtomicBoolean(false);
+
+	public static void cancelActive() {
+		CANCELLED.set(true);
+		InputStream in = ACTIVE_STREAM.getAndSet(null);
+		if (in != null) {
+			try {
+				in.close();
+			} catch (IOException ignored) {
+			}
+		}
+	}
+
+	/** 用户点过取消 */
+	public static final class CancelledException extends RuntimeException {
+		CancelledException(String msg) {
+			super(msg);
+		}
+	}
+
+	public static CompletableFuture<AiReply> askPlan(String description, String posText, AiConfig cfg) {
+		return askPlan(description, posText, cfg, null, null, null, null);
+	}
+
+	public static CompletableFuture<AiReply> askPlan(String description, String posText, AiConfig cfg,
+			String previousReply, String adjustment) {
+		return askPlan(description, posText, cfg, previousReply, adjustment, null, null);
+	}
+
+	public static CompletableFuture<AiReply> askPlan(String description, String posText, AiConfig cfg,
+			String previousReply, String adjustment, String repairHint) {
+		return askPlan(description, posText, cfg, previousReply, adjustment, repairHint, null);
 	}
 
 	/**
-	 * 带对话历史的请求：previousReply 非空时为"按意见调整"模式——
-	 * 把上次的原始方案作为 assistant 消息发回，AI 在自己方案的基础上修改。
+	 * 带对话历史的流式请求。
+	 * @param listener 可选：实时推送思考/正文增量
 	 */
-	public static CompletableFuture<String> askPlan(String description, String posText, AiConfig cfg,
-			String previousReply, String adjustment) {
+	public static CompletableFuture<AiReply> askPlan(String description, String posText, AiConfig cfg,
+			String previousReply, String adjustment, String repairHint, StreamListener listener) {
 		return CompletableFuture.supplyAsync(() -> {
+			CANCELLED.set(false);
 			String endpoint = cfg.chatEndpoint();
 
 			JsonObject body = new JsonObject();
 			body.addProperty("model", cfg.modelName());
-			body.addProperty("stream", false);
-			// 思考模式：默认按配置发送；若服务端因此报错，会在下面自动去掉该字段重试一次
-			// （不同厂商对 thinking 的支持不一，有的甚至会直接返回 500）。
+			body.addProperty("stream", true);
 			boolean useThinking = cfg.thinkingEnabled;
 			JsonObject thinkingObj = new JsonObject();
 			thinkingObj.addProperty("type", "enabled");
@@ -177,58 +401,75 @@ public class AiClient {
 			user.addProperty("content", "在坐标 " + posText + " 建造：" + description);
 			messages.add(user);
 
-			if (previousReply != null && adjustment != null) {
-				// 迭代调整：带上自己上次的方案，只改需要调整的部分
+			if (previousReply != null) {
 				JsonObject assistant = new JsonObject();
 				assistant.addProperty("role", "assistant");
 				assistant.addProperty("content", previousReply);
 				messages.add(assistant);
-
+			}
+			if (previousReply != null && adjustment != null) {
 				JsonObject feedback = new JsonObject();
 				feedback.addProperty("role", "user");
 				feedback.addProperty("content", "调整意见：" + adjustment
-						+ "\n请基于你上面的规格输出【完整的新规格 JSON】（spec_version/archetype/floors/layer_height/"
-						+ "features/materials/roof 等字段都要有，结构完全一致），只改需要调整的字段，其余原样保留。"
-						+ "只输出 JSON，禁止任何其他文字，不要代码块。");
+						+ "\n请基于你上面的规格输出【完整的新规格 JSON】，只改需要调整的字段，其余原样保留，"
+						+ "结构必须与上一次完全一致（字段不能丢）：保留 spec_version/kind/name/"
+						+ "size/palette/mirror/ops。只输出 JSON，禁止任何其他文字，不要代码块。");
 				messages.add(feedback);
+			}
+			if (repairHint != null) {
+				JsonObject fix = new JsonObject();
+				fix.addProperty("role", "user");
+				fix.addProperty("content", "⚠ 你上面的输出不合格，被程序拒绝：\n" + repairHint
+						+ "\n请重新输出【完整的新规格 JSON】。只输出 JSON，禁止任何其他文字，不要代码块。");
+				messages.add(fix);
 			}
 			body.add("messages", messages);
 
-			// 最多尝试 3 次：
-			//   1) 服务端拒绝 thinking 参数时，自动去掉该参数重试；
-			//   2) 5xx / 429 / 408 / 超时 / 连接失败 时退避重试（偶发服务端故障能自愈）。
-			final int maxAttempts = 3;
+			// 空闲超时最多重试 1 次（避免 4 次重试把等待放大到不可接受）；
+			// thinking 被拒 / 5xx 仍可走原有重试，但总次数仍受 maxAttempts 约束。
+			final int maxAttempts = 4;
+			final int idleTimeoutMs = Math.max(10, cfg.idleTimeoutSeconds) * 1000;
 			String lastReason = null;
 			for (int attempt = 1; attempt <= maxAttempts; attempt++) {
-				if (useThinking) {
-					body.add("thinking", thinkingObj);
-				} else {
-					body.remove("thinking");
-				}
+				applyThinkingFlags(body, thinkingObj, useThinking);
 				HttpRequest.Builder rb = HttpRequest.newBuilder()
 						.uri(URI.create(endpoint))
-						.timeout(Duration.ofMinutes(10))
+						// 只保护到响应头；响应体阶段用空闲超时
+						.timeout(Duration.ofSeconds(30))
 						.header("Content-Type", "application/json")
+						.header("Accept", "text/event-stream, application/json, application/x-ndjson")
 						.header("User-Agent", "minecraft-ai-mod")
 						.POST(HttpRequest.BodyPublishers.ofString(body.toString()));
 				if (!cfg.apiKey().isEmpty()) {
 					rb.header("Authorization", "Bearer " + cfg.apiKey());
 				}
 				try {
-					MinecraftAIMod.LOGGER.info("[Minecraft AI] 请求发出: model={} endpoint={} thinking={} (第 {} 次)",
-							cfg.modelName(), endpoint, useThinking, attempt);
-					HttpResponse<String> response = HTTP.send(rb.build(), HttpResponse.BodyHandlers.ofString());
+					MinecraftAIMod.LOGGER.info("[Minecraft AI] 流式请求发出: model={} endpoint={} thinking={} (第 {} 次, 空闲超时={}s)",
+							cfg.modelName(), endpoint, useThinking, attempt, cfg.idleTimeoutSeconds);
+					HttpResponse<InputStream> response = HTTP.send(rb.build(), HttpResponse.BodyHandlers.ofInputStream());
 					int code = response.statusCode();
-					MinecraftAIMod.LOGGER.info("[Minecraft AI] 请求返回: HTTP {}", code);
+					MinecraftAIMod.LOGGER.info("[Minecraft AI] 响应头返回: HTTP {}", code);
 					if (code == 200) {
-						return extractContent(response.body(), cfg);
+						return readStream(response.body(), cfg, listener, idleTimeoutMs,
+								Math.max(60, cfg.maxGenerateSeconds) * 1000, useThinking);
 					}
-					lastReason = describeError(code, response.body());
+					// 非 200：读错误体
+					String errBody = readAllQuietly(response.body());
+					lastReason = describeError(code, errBody);
 					MinecraftAIMod.LOGGER.error("[Minecraft AI] 请求失败: {}", lastReason);
 					boolean retryable = code == 408 || code == 429 || code >= 500;
-					if (attempt < maxAttempts && useThinking) {
+					// 开思考被拒 → 关思考重试
+					if (attempt < maxAttempts && useThinking && (code == 400 || code == 422)) {
 						useThinking = false;
-						MinecraftAIMod.LOGGER.warn("[Minecraft AI] 去掉 thinking 参数后重试");
+						MinecraftAIMod.LOGGER.warn("[Minecraft AI] 服务端拒绝思考参数，关思考后重试");
+						continue;
+					}
+					// 关思考的附加方言字段被拒 → 只省略 thinking，再试
+					if (attempt < maxAttempts && !useThinking && (code == 400 || code == 422)) {
+						body.remove("thinking");
+						body.remove("enable_thinking");
+						body.remove("chat_template_kwargs");
+						MinecraftAIMod.LOGGER.warn("[Minecraft AI] 服务端拒绝思考禁用字段，改用最小请求体重试");
 						continue;
 					}
 					if (attempt < maxAttempts && retryable) {
@@ -238,6 +479,16 @@ public class AiClient {
 						continue;
 					}
 					throw new RuntimeException(lastReason);
+				} catch (IdleTimeoutException e) {
+					lastReason = "AI 响应空闲超时（" + cfg.idleTimeoutSeconds
+							+ " 秒没有新数据）。后端可能卡住，已自动断开。";
+					MinecraftAIMod.LOGGER.error("[Minecraft AI] {}", lastReason);
+					// 空闲超时最多再试 1 次
+					if (attempt < 2) {
+						sleepQuietly(800L);
+						continue;
+					}
+					throw new RuntimeException(lastReason, e);
 				} catch (java.net.ConnectException e) {
 					lastReason = "无法连接 AI 服务 " + endpoint + "（请检查 Ollama 是否启动 / 网络是否可用）";
 					MinecraftAIMod.LOGGER.error("[Minecraft AI] 连接失败", e);
@@ -247,16 +498,35 @@ public class AiClient {
 					}
 					throw new RuntimeException(lastReason, e);
 				} catch (java.net.http.HttpTimeoutException e) {
-					lastReason = "AI 响应超时（免费/大模型高峰期较慢，可重试或换模型）";
-					MinecraftAIMod.LOGGER.error("[Minecraft AI] 响应超时", e);
+					lastReason = "AI 响应头超时（连接或首包太慢）";
+					MinecraftAIMod.LOGGER.error("[Minecraft AI] 响应头超时", e);
 					if (attempt < maxAttempts) {
 						sleepQuietly(1500L * attempt);
 						continue;
 					}
 					throw new RuntimeException(lastReason, e);
+				} catch (TruncatedReplyException te) {
+					if (attempt < maxAttempts && useThinking) {
+						useThinking = false;
+						MinecraftAIMod.LOGGER.warn("[Minecraft AI] 回复被截断且正文为空，关掉思考模式后重试");
+						continue;
+					}
+					throw new RuntimeException(te.getMessage());
+				} catch (ThinkingBudgetException tbe) {
+					if (attempt < maxAttempts && useThinking) {
+						useThinking = false;
+						MinecraftAIMod.LOGGER.warn("[Minecraft AI] {}", tbe.getMessage());
+						continue;
+					}
+					throw new RuntimeException(tbe.getMessage());
+				} catch (CancelledException ce) {
+					throw ce;
 				} catch (RuntimeException re) {
-					throw re;   // 上面已经归类好的错误，直接抛给界面
+					throw re;
 				} catch (Exception e) {
+					if (CANCELLED.get()) {
+						throw new CancelledException("已取消本次生成");
+					}
 					MinecraftAIMod.LOGGER.error("[Minecraft AI] 请求失败: {}", e.getMessage(), e);
 					throw new RuntimeException("AI 请求失败: " + e.getMessage(), e);
 				}
@@ -265,39 +535,236 @@ public class AiClient {
 		}, EXECUTOR);
 	}
 
-	private static String extractContent(String responseBody, AiConfig cfg) {
-		JsonObject json;
-		try {
-			json = JsonParser.parseString(responseBody).getAsJsonObject();
-		} catch (Exception e) {
-			MinecraftAIMod.LOGGER.error("[Minecraft AI] AI 响应不是有效 JSON: {}", truncate(responseBody, 500));
-			throw new RuntimeException("AI 返回的不是有效 JSON: " + truncate(responseBody, 200));
+	/** 空闲超时（响应体阶段太久没数据）。 */
+	private static final class IdleTimeoutException extends IOException {
+		IdleTimeoutException(String msg) {
+			super(msg);
 		}
-		if ("openai".equals(cfg.provider)) {
-			JsonArray choices = json.getAsJsonArray("choices");
-			if (choices == null || choices.isEmpty()) {
-				MinecraftAIMod.LOGGER.error("[Minecraft AI] AI 响应缺少 choices: {}", truncate(responseBody, 500));
-				throw new RuntimeException("AI 返回异常: " + truncate(responseBody, 200));
+	}
+
+	/** 回复被输出长度截断、且正文为空时抛出。 */
+	private static final class TruncatedReplyException extends RuntimeException {
+		TruncatedReplyException(String msg) {
+			super(msg);
+		}
+	}
+
+	/**
+	 * 边读流式响应边解析，带空闲看门狗 + 总时长上限。
+	 * 支持 OpenAI SSE（data: {...} / data: [DONE]）与 Ollama NDJSON（整行 JSON）。
+	 *
+	 * 注意：思考流会持续刷新 lastActivity，空闲超时拦不住「一直思考、正文永远不来」。
+	 * 所以另加 maxTotalMs 总时长硬顶（默认 5 分钟），到点强制断开。
+	 */
+	private static AiReply readStream(InputStream raw, AiConfig cfg, StreamListener listener, int idleTimeoutMs)
+			throws Exception {
+		return readStream(raw, cfg, listener, idleTimeoutMs,
+				Math.max(60, cfg.maxGenerateSeconds) * 1000, true);
+	}
+
+	private static AiReply readStream(InputStream raw, AiConfig cfg, StreamListener listener, int idleTimeoutMs,
+			int maxTotalMs, boolean thinkingRequested) throws Exception {
+		final int thinkingBudgetMs = Math.max(15, cfg.thinkingBudgetSeconds) * 1000;
+		final long startMs = System.currentTimeMillis();
+		ACTIVE_STREAM.set(raw);
+		StringBuilder content = new StringBuilder();
+		StringBuilder thinking = new StringBuilder();
+		String finishReason = null;
+		AtomicLong lastActivity = new AtomicLong(System.currentTimeMillis());
+		AtomicBoolean done = new AtomicBoolean(false);
+		AtomicReference<Exception> killError = new AtomicReference<>();
+
+		Thread watchdog = new Thread(() -> {
+			try {
+				while (!done.get()) {
+					Thread.sleep(400);
+					if (CANCELLED.get()) {
+						killError.set(new CancelledException("已取消本次生成"));
+						closeQuietly(raw);
+						break;
+					}
+					long now = System.currentTimeMillis();
+					if (now - startMs > maxTotalMs) {
+						killError.set(new IOException("生成总超时（" + (maxTotalMs / 1000)
+								+ " 秒）。可简化提示词、降低尺寸，或换更快的模型后重试。"));
+						closeQuietly(raw);
+						break;
+					}
+					// 思考预算：只在【本次请求开启了思考】时才掐断。
+					// 用户关了思考但模型仍吐 reasoning 时，应用总超时/空闲超时，而不是误判成思考超预算。
+					if (thinkingRequested && content.length() == 0 && thinking.length() > 0
+							&& now - startMs > thinkingBudgetMs) {
+						killError.set(new ThinkingBudgetException(
+								"思考超过预算（" + (thinkingBudgetMs / 1000)
+										+ " 秒）仍没有给出正文，将关掉思考模式重试"));
+						closeQuietly(raw);
+						break;
+					}
+					if (now - lastActivity.get() > idleTimeoutMs) {
+						killError.set(new IdleTimeoutException("idle " + idleTimeoutMs + "ms"));
+						closeQuietly(raw);
+						break;
+					}
+				}
+			} catch (InterruptedException ignored) {
+				Thread.currentThread().interrupt();
 			}
-			JsonObject message = choices.get(0).getAsJsonObject().getAsJsonObject("message");
-			if (message == null) {
-				throw new RuntimeException("AI 返回异常（缺少 message）: " + truncate(responseBody, 200));
+		}, "minecraft-ai-idle-watchdog");
+		watchdog.setDaemon(true);
+		watchdog.start();
+
+		try (BufferedReader reader = new BufferedReader(new InputStreamReader(raw, StandardCharsets.UTF_8))) {
+			String line;
+			while ((line = reader.readLine()) != null) {
+				lastActivity.set(System.currentTimeMillis());
+				if (line.isEmpty()) {
+					continue;
+				}
+				String payload = line;
+				if (payload.startsWith("data:")) {
+					payload = payload.substring(5).trim();
+				}
+				if (payload.isEmpty() || "[DONE]".equals(payload)) {
+					if ("[DONE]".equals(payload)) {
+						break;
+					}
+					continue;
+				}
+				JsonObject obj;
+				try {
+					JsonElement el = JsonParser.parseString(payload);
+					if (!el.isJsonObject()) {
+						continue;
+					}
+					obj = el.getAsJsonObject();
+				} catch (Exception parseEx) {
+					continue;
+				}
+				consumeChunk(obj, content, thinking, listener);
+				if (obj.has("choices")) {
+					JsonArray choices = obj.getAsJsonArray("choices");
+					if (choices != null && !choices.isEmpty()) {
+						JsonObject c0 = choices.get(0).getAsJsonObject();
+						JsonElement fr = c0.get("finish_reason");
+						if (fr != null && fr.isJsonPrimitive() && !fr.isJsonNull()) {
+							String s = fr.getAsString();
+							if (s != null && !s.isEmpty() && !"null".equals(s)) {
+								finishReason = s;
+							}
+						}
+					}
+				}
+				if (obj.has("done") && obj.get("done").isJsonPrimitive()
+						&& obj.get("done").getAsBoolean()) {
+					break;
+				}
 			}
-			String content = getNonNullString(message, "content");
-			// 思考型模型可能只输出到 reasoning 字段，content 为空时兜底取推理文本
-			if (content == null || content.isBlank()) {
-				content = getNonNullString(message, "reasoning_content");
+		} catch (Exception readEx) {
+			// 看门狗关流时 readLine 会抛 IOException（消息里常带 "cancelled"），
+			// 必须优先抛出真正的 killError（空闲/总超时/思考预算/用户取消），
+			// 否则上层会把超时误判成「已取消」。
+			if (killError.get() != null) {
+				throw killError.get();
 			}
-			if (content == null || content.isBlank()) {
-				content = getNonNullString(message, "reasoning");
+			if (CANCELLED.get()) {
+				throw new CancelledException("已取消本次生成");
 			}
-			if (content == null || content.isBlank()) {
-				MinecraftAIMod.LOGGER.error("[Minecraft AI] AI 回复为空: {}", truncate(responseBody, 500));
+			throw readEx;
+		} finally {
+			done.set(true);
+			ACTIVE_STREAM.compareAndSet(raw, null);
+			closeQuietly(raw);
+		}
+
+		if (killError.get() != null) {
+			throw killError.get();
+		}
+
+		String contentStr = content.toString();
+		String thinkingStr = thinking.toString();
+		boolean truncated = "length".equalsIgnoreCase(finishReason);
+		if (truncated) {
+			MinecraftAIMod.LOGGER.warn("[Minecraft AI] ⚠ AI 回复被输出长度截断（finish_reason=length）");
+		}
+		if (contentStr.isBlank()) {
+			if (truncated) {
+				// ★★ 绝不把 reasoning/thinking 当成品规格
+				throw new TruncatedReplyException("AI 回复被输出长度截断，正文一个字都没有"
+						+ "（输出预算被思考过程吃光了）。请重试；若反复如此，"
+						+ "请在描述里要求画简单些，或在配置里关掉思考模式、换一个输出上限更大的模型。");
+			}
+			if (thinkingStr.isBlank()) {
 				throw new RuntimeException("AI 返回为空（模型可能被限流或不支持当前参数，请重试或换个模型）");
 			}
-			return content;
+			// 非截断但正文空、只有思考：仍按不可用处理（铁律：宁可报错也不盖假楼）
+			throw new RuntimeException("AI 只输出了思考过程，没有给出规格 JSON。请重试，或在配置里关掉思考模式。");
 		}
-		return getNonNullString(json.getAsJsonObject("message"), "content");
+		return new AiReply(contentStr, thinkingStr);
+	}
+
+	/** 解析单条流式 chunk，累加 content / thinking，并回调 listener。 */
+	private static void consumeChunk(JsonObject obj, StringBuilder content, StringBuilder thinking,
+			StreamListener listener) {
+		// ---- OpenAI 风格 ----
+		if (obj.has("choices")) {
+			JsonArray choices = obj.getAsJsonArray("choices");
+			if (choices == null || choices.isEmpty()) {
+				return;
+			}
+			JsonObject c0 = choices.get(0).getAsJsonObject();
+			JsonObject delta = c0.has("delta") && c0.get("delta").isJsonObject()
+					? c0.get("delta").getAsJsonObject() : null;
+			// 有的网关放在 message
+			if (delta == null && c0.has("message") && c0.get("message").isJsonObject()) {
+				delta = c0.get("message").getAsJsonObject();
+			}
+			if (delta == null) {
+				return;
+			}
+			String thinkPiece = firstString(delta, "reasoning_content", "reasoning", "thinking");
+			if (thinkPiece != null && !thinkPiece.isEmpty()) {
+				thinking.append(thinkPiece);
+				if (listener != null) {
+					listener.onThinking(thinkPiece);
+				}
+			}
+			String contentPiece = getNonNullString(delta, "content");
+			if (contentPiece != null && !contentPiece.isEmpty()) {
+				content.append(contentPiece);
+				if (listener != null) {
+					listener.onContent(contentPiece);
+				}
+			}
+			return;
+		}
+		// ---- Ollama /api/chat NDJSON ----
+		if (obj.has("message") && obj.get("message").isJsonObject()) {
+			JsonObject msg = obj.getAsJsonObject("message");
+			String thinkPiece = firstString(msg, "thinking", "reasoning_content", "reasoning");
+			if (thinkPiece != null && !thinkPiece.isEmpty()) {
+				thinking.append(thinkPiece);
+				if (listener != null) {
+					listener.onThinking(thinkPiece);
+				}
+			}
+			String contentPiece = getNonNullString(msg, "content");
+			if (contentPiece != null && !contentPiece.isEmpty()) {
+				content.append(contentPiece);
+				if (listener != null) {
+					listener.onContent(contentPiece);
+				}
+			}
+		}
+	}
+
+	private static String firstString(JsonObject obj, String... keys) {
+		for (String k : keys) {
+			String s = getNonNullString(obj, k);
+			if (s != null && !s.isEmpty()) {
+				return s;
+			}
+		}
+		return null;
 	}
 
 	private static String getNonNullString(JsonObject obj, String key) {
@@ -307,6 +774,27 @@ public class AiClient {
 		try {
 			return obj.get(key).getAsString();
 		} catch (Exception e) {
+			return "";
+		}
+	}
+
+	private static void closeQuietly(InputStream in) {
+		if (in == null) {
+			return;
+		}
+		try {
+			in.close();
+		} catch (IOException ignored) {
+		}
+	}
+
+	private static String readAllQuietly(InputStream in) {
+		if (in == null) {
+			return "";
+		}
+		try (InputStream i = in) {
+			return new String(i.readAllBytes(), StandardCharsets.UTF_8);
+		} catch (IOException e) {
 			return "";
 		}
 	}
@@ -330,8 +818,6 @@ public class AiClient {
 				if (code == 200) {
 					return true;
 				}
-				// 预检只是提示：各厂商对 /models 的支持不一（有的返回 401/404），
-				// 不能据此断言"后端不可达"，这里把真实原因记进日志。
 				MinecraftAIMod.LOGGER.warn("[Minecraft AI] 预检: {} → HTTP {}（{}）",
 						cfg.availabilityEndpoint(), code, describeError(code, response.body()));
 				return false;
@@ -360,7 +846,30 @@ public class AiClient {
 		return excerpt.isEmpty() ? hint : hint + " | " + excerpt;
 	}
 
-	/** Thread.sleep 的静默版（不抛受检异常，供 lambda 内使用） */
+	/**
+	 * 写入/清除思考参数。关思考时兼容多家方言：
+	 * - OpenAI 风格：不带 thinking / thinking:{type:disabled}
+	 * - Qwen / vLLM / 部分网关：enable_thinking=false、chat_template_kwargs.enable_thinking=false
+	 * 某些后端会拒未知字段 —— 由调用方捕获 400 后去掉再重试。
+	 */
+	private static void applyThinkingFlags(JsonObject body, JsonObject thinkingObj, boolean useThinking) {
+		body.remove("thinking");
+		body.remove("enable_thinking");
+		body.remove("chat_template_kwargs");
+		if (useThinking) {
+			body.add("thinking", thinkingObj);
+			body.addProperty("enable_thinking", true);
+		} else {
+			JsonObject disabled = new JsonObject();
+			disabled.addProperty("type", "disabled");
+			body.add("thinking", disabled);
+			body.addProperty("enable_thinking", false);
+			JsonObject kwargs = new JsonObject();
+			kwargs.addProperty("enable_thinking", false);
+			body.add("chat_template_kwargs", kwargs);
+		}
+	}
+
 	private static void sleepQuietly(long ms) {
 		try {
 			Thread.sleep(ms);
