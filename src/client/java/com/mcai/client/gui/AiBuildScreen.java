@@ -59,6 +59,11 @@ public class AiBuildScreen extends Screen {
 	private EditBox posXField, posYField, posZField;
 	private EditBox posX2Field, posY2Field, posZ2Field;
 	private Button sendButton;
+	private Button attachButton;
+	private String attachedImageDataUrl;
+	private String attachedImageName;
+	/** 系统选图框不可用时改为读输入框里的路径 */
+	private boolean imageDialogBroken = false;
 	private Button buildButton;
 	private Button undoButton;
 	private Button settingsButton;
@@ -150,15 +155,30 @@ public class AiBuildScreen extends Screen {
 		addRenderableWidget(posZ2Field);
 
 		int btnH = 20;
-		int inputW = panelW - 20 - 70 - 8;
+		int pasteW = 52;
+		int attachW = 52;
+		int sendW = 56;
+		int inputW = panelW - 20 - pasteW - attachW - sendW - 24;
 		inputField = new EditBox(this.font, panelX + 10, inputY, inputW, inputH, Component.literal("提示词"));
 		inputField.setMaxLength(10000);
-		inputField.setHint(Component.literal("输入提示词，发送生成/修改…"));
+		inputField.setHint(Component.literal("输入提示词…可 Ctrl+V 粘贴图片，或「附图」"));
 		addRenderableWidget(inputField);
 		setInitialFocus(inputField);
 
+		Button pasteButton = Button.builder(Component.literal("粘贴"), b -> {
+			if (!tryPasteClipboardImage()) {
+				// 失败时已有 status 提示
+			}
+		}).bounds(panelX + 10 + inputW + 4, inputY, pasteW, inputH).build();
+		addRenderableWidget(pasteButton);
+
+		attachButton = Button.builder(Component.literal("附图"), b -> pickImage())
+				.bounds(panelX + 10 + inputW + 8 + pasteW, inputY, attachW, inputH)
+				.build();
+		addRenderableWidget(attachButton);
+
 		sendButton = Button.builder(Component.literal("发送"), b -> doSend())
-				.bounds(panelX + 10 + inputW + 8, inputY, 62, inputH)
+				.bounds(panelX + 10 + inputW + 12 + pasteW + attachW, inputY, sendW, inputH)
 				.build();
 		addRenderableWidget(sendButton);
 
@@ -250,6 +270,97 @@ public class AiBuildScreen extends Screen {
 		return new BlockPos(0, 64, 0);
 	}
 
+	/** 附图：打开系统文件管理器选图 */
+	private void pickImage() {
+		Thread t = new Thread(() -> {
+			try {
+				java.io.File file = com.mcai.client.ai.ImageAttach.pickImageFile();
+				if (file == null) {
+					return; // 取消
+				}
+				loadImageFile(file);
+			} catch (Throwable e) {
+				com.mcai.MinecraftAIMod.LOGGER.error("[Minecraft AI] 打开选图框失败", e);
+				String reason = e.getClass().getSimpleName()
+						+ (e.getMessage() == null ? "" : (": " + e.getMessage()));
+				if (this.minecraft != null) {
+					this.minecraft.execute(() -> lastErrorStatus = "打不开系统选图框（" + reason + "）");
+				}
+			}
+		}, "minecraft-ai-pick-image");
+		t.setDaemon(true);
+		t.start();
+	}
+
+	/**
+	 * Ctrl+V / 粘贴按钮：剪贴板有图则附上；是文字则返回 false 让输入框自己粘贴。
+	 */
+	private boolean tryPasteClipboardImage() {
+		try {
+			java.awt.image.BufferedImage bi = com.mcai.client.ai.ImageAttach.imageFromClipboard();
+			if (bi != null) {
+				attachedImageDataUrl = com.mcai.client.ai.ImageAttach.toDataUrl(bi);
+				attachedImageName = "剪贴板图片";
+				lastErrorStatus = "";
+				return true;
+			}
+		} catch (Throwable e) {
+			com.mcai.MinecraftAIMod.LOGGER.warn("[Minecraft AI] 粘贴图片失败", e);
+		}
+		// 没图：文字剪贴板安静失败，交给 EditBox
+		try {
+			java.awt.datatransfer.Clipboard clip =
+					java.awt.Toolkit.getDefaultToolkit().getSystemClipboard();
+			java.awt.datatransfer.Transferable t = clip.getContents(null);
+			if (t != null && t.isDataFlavorSupported(java.awt.datatransfer.DataFlavor.stringFlavor)) {
+				return false;
+			}
+		} catch (Throwable ignored) {
+		}
+		lastErrorStatus = "剪贴板没有图片：先截图（Win+Shift+S）或复制图片，再点「粘贴」";
+		return false;
+	}
+
+	private void loadImageFile(java.io.File file) {
+		try {
+			String dataUrl = com.mcai.client.ai.ImageAttach.toDataUrl(file);
+			this.attachedImageDataUrl = dataUrl;
+			this.attachedImageName = file.getName();
+			this.lastErrorStatus = "";
+		} catch (Exception ex) {
+			com.mcai.MinecraftAIMod.LOGGER.error("[Minecraft AI] 加载图片失败: {}", file, ex);
+			String msg = ex.getMessage() == null ? ex.toString() : ex.getMessage();
+			this.lastErrorStatus = "读图失败：" + msg;
+		}
+	}
+
+	/** Ctrl+V：剪贴板是图片则附图；是文字则走默认粘贴到输入框 */
+	@Override
+	public boolean keyPressed(net.minecraft.client.input.KeyEvent event) {
+		try {
+			if (event != null && event.key() == org.lwjgl.glfw.GLFW.GLFW_KEY_V) {
+				boolean ctrl = event.hasControlDown();
+				if (!ctrl) {
+					// 兜底：直接读 GLFW 修饰键
+					try {
+						long win = org.lwjgl.glfw.GLFW.glfwGetCurrentContext();
+						ctrl = win != 0 && (org.lwjgl.glfw.GLFW.glfwGetKey(win, org.lwjgl.glfw.GLFW.GLFW_KEY_LEFT_CONTROL) != 0
+								|| org.lwjgl.glfw.GLFW.glfwGetKey(win, org.lwjgl.glfw.GLFW.GLFW_KEY_RIGHT_CONTROL) != 0);
+					} catch (Throwable ignored) {
+					}
+				}
+				if (ctrl) {
+					// 图片则附上；纯文字则交回默认粘贴
+					if (tryPasteClipboardImage()) {
+						return true;
+					}
+				}
+			}
+		} catch (Throwable ignored) {
+		}
+		return super.keyPressed(event);
+	}
+
 	private void doSend() {
 		BuildTaskManager m = BuildTaskManager.INSTANCE;
 		if (m.isGenerating()) {
@@ -257,9 +368,12 @@ public class AiBuildScreen extends Screen {
 			return;
 		}
 		String desc = inputField.getValue().trim();
-		if (desc.isEmpty()) {
-			lastErrorStatus = "请先输入提示词";
+		if (desc.isEmpty() && attachedImageDataUrl == null) {
+			lastErrorStatus = "请先输入提示词，或附图后发送";
 			return;
+		}
+		if (desc.isEmpty()) {
+			desc = "根据参考图建造" + (attachedImageName != null ? "" : "");
 		}
 		BlockPos origin = readOrigin();
 		if (origin == null) {
@@ -284,9 +398,16 @@ public class AiBuildScreen extends Screen {
 					+ ") 到 (" + bound.getX() + " " + bound.getY() + " " + bound.getZ()
 					+ ")（宽 " + w + " 深 " + d + " 高 " + h + "），建筑要尽量填满这个空间，但绝不能超出它的范围";
 		}
+		String img = attachedImageDataUrl;
+		String imgName = attachedImageName;
 		inputField.setValue("");
+		attachedImageDataUrl = null;
+		attachedImageName = null;
 		lastErrorStatus = "";
-		m.send(this.minecraft, desc, posText, origin, bound);
+		if (img != null) {
+			desc = desc + "（参考图：" + (imgName == null ? "附图" : imgName) + "）";
+		}
+		m.send(this.minecraft, desc, posText, origin, bound, img);
 		scrollToBottom();
 		updateButtons();
 	}
@@ -474,7 +595,10 @@ public class AiBuildScreen extends Screen {
 		// 状态提示（聊天框与坐标之间，不重叠）
 		String tip;
 		int tipCol;
-		if (m.isGenerating()) {
+		if (attachedImageDataUrl != null) {
+			tip = "已附图：" + (attachedImageName == null ? "参考图" : attachedImageName) + "（发送即按图生成）";
+			tipCol = COL_ACCENT;
+		} else if (m.isGenerating()) {
 			String live = m.liveThinking();
 			tip = "AI 思考中… " + m.elapsedSeconds() + "s"
 					+ (live.isEmpty() ? "" : "（思考已 " + live.length() + " 字）");

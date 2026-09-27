@@ -25,10 +25,13 @@ import com.mcai.common.BuildingPlan;
  */
 public final class FreeformBuilder {
 
-	/** 方块数上限：防止模型写出巨物把游戏卡死（正常载具/雕像在几千块量级） */
-	public static final int MAX_BLOCKS = 100_000;
-	/** 单边尺寸上限 */
-	public static final int MAX_SIDE = 128;
+	/**
+	 * 方块数上限：防止模型写出超巨物把游戏卡死/吃光内存。
+	 * 大型车站/城堡可到数十万块，故放宽到 50 万（仍拦 120³ 级别的失控 box）。
+	 */
+	public static final int MAX_BLOCKS = 500_000;
+	/** 单边尺寸上限（大站房/长桥需要） */
+	public static final int MAX_SIDE = 256;
 
 	private FreeformBuilder() {
 	}

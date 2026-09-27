@@ -35,6 +35,8 @@ public class BuildTaskManager {
 		/** AI 消息附带的方案（可展示 3D 预览 / 确认建造） */
 		public BuildingPlan plan;
 		public boolean planReady = false;
+		/** 用户消息是否带参考图 */
+		public boolean hasImage = false;
 
 		public ChatMsg(MsgRole role, String text) {
 			this.role = role;
@@ -156,32 +158,41 @@ public class BuildTaskManager {
 		return liveContent;
 	}
 
-	/** 发送聊天消息：会话里已有方案则视为「修改」，否则「新生成」 */
+	/** 发送聊天消息：会话里已有方案则视为「修改」，否则「新生成」；imageDataUrl 可选 */
 	public void send(Minecraft client, String desc, String pos,
-			net.minecraft.core.BlockPos buildOrigin, net.minecraft.core.BlockPos buildBound) {
+			net.minecraft.core.BlockPos buildOrigin, net.minecraft.core.BlockPos buildBound,
+			String imageDataUrl) {
 		this.description = desc;
 		this.posText = pos;
 		this.current.origin = buildOrigin;
 		this.current.bound = buildBound;
 		this.current.adjusted = current.rawReply != null;
-		current.messages.add(new ChatMsg(MsgRole.USER, desc));
+		ChatMsg um = new ChatMsg(MsgRole.USER, desc + (imageDataUrl != null ? "\n[附参考图]" : ""));
+		um.hasImage = imageDataUrl != null;
+		current.messages.add(um);
 		if (current.title.equals("新会话") || current.messages.size() == 1) {
 			current.title = desc.length() > 12 ? desc.substring(0, 12) + "…" : desc;
 		}
-		launch(client, current.rawReply, current.rawReply != null ? desc : null);
+		launch(client, current.rawReply, current.rawReply != null ? desc : null, imageDataUrl);
+	}
+
+	/** 兼容：无图发送 */
+	public void send(Minecraft client, String desc, String pos,
+			net.minecraft.core.BlockPos buildOrigin, net.minecraft.core.BlockPos buildBound) {
+		send(client, desc, pos, buildOrigin, buildBound, null);
 	}
 
 	/** 兼容旧调用：全新设计 */
 	public void start(Minecraft client, String desc, String pos,
 			net.minecraft.core.BlockPos buildOrigin, net.minecraft.core.BlockPos buildBound) {
-		send(client, desc, pos, buildOrigin, buildBound);
+		send(client, desc, pos, buildOrigin, buildBound, null);
 	}
 
 	/** 兼容旧调用：基于当前方案按意见调整 */
 	public void adjust(Minecraft client, String opinion) {
 		current.adjusted = true;
 		current.messages.add(new ChatMsg(MsgRole.USER, opinion));
-		launch(client, current.rawReply, opinion);
+		launch(client, current.rawReply, opinion, null);
 	}
 
 	public void cancel() {
@@ -189,15 +200,16 @@ public class BuildTaskManager {
 		// 文案由请求异常路径统一写入，避免重复气泡
 	}
 
-	private void launch(Minecraft client, String previousReply, String adjustment) {
-		launch(client, previousReply, adjustment, null, 0);
+	private void launch(Minecraft client, String previousReply, String adjustment, String imageDataUrl) {
+		launch(client, previousReply, adjustment, null, 0, imageDataUrl);
 	}
 
 	/**
 	 * @param repairHint 非空 = 上一轮结果被程序判定不合格，带着"错在哪"重做一次
 	 * @param attempt    已重做次数（只允许重做 1 次，避免无限循环）
 	 */
-	private void launch(Minecraft client, String previousReply, String adjustment, String repairHint, int attempt) {
+	private void launch(Minecraft client, String previousReply, String adjustment, String repairHint, int attempt,
+			String imageDataUrl) {
 		phase = Phase.GENERATING;
 		if (attempt == 0) {
 			startMs = System.currentTimeMillis();
@@ -223,7 +235,7 @@ public class BuildTaskManager {
 		// 新生成：两阶段（设计要点 → ops）。调整 / 自动重做：直接阶段二。
 		if (previousReply == null && repairHint == null && attempt == 0) {
 			current.messages.add(new ChatMsg(MsgRole.SYSTEM, "① 正在出设计要点…"));
-			AiClient.askDesignBrief(desc, posText, MinecraftAIClient.CONFIG, listener)
+			AiClient.askDesignBrief(desc, posText, MinecraftAIClient.CONFIG, imageDataUrl, listener)
 					.thenAcceptAsync(briefReply -> {
 						String brief = briefReply.content == null ? "" : briefReply.content.trim();
 						String think1 = briefReply.thinking == null ? "" : briefReply.thinking;
@@ -245,7 +257,7 @@ public class BuildTaskManager {
 						current.messages.add(new ChatMsg(MsgRole.SYSTEM, "② 按设计要点绘制方块…"));
 						liveThinking = "";
 						// 阶段二：带着设计要点画 ops
-						launchOps(client, desc, previousReply, adjustment, repairHint, attempt, briefJson, listener);
+						launchOps(client, desc, previousReply, adjustment, repairHint, attempt, briefJson, listener, imageDataUrl);
 					}, client)
 					.exceptionally(e -> {
 						Throwable t = e;
@@ -265,7 +277,7 @@ public class BuildTaskManager {
 					});
 			return;
 		}
-		launchOps(client, desc, previousReply, adjustment, repairHint, attempt, null, listener);
+		launchOps(client, desc, previousReply, adjustment, repairHint, attempt, null, listener, imageDataUrl);
 	}
 
 	private static String truncateBrief(String s) {
@@ -275,14 +287,15 @@ public class BuildTaskManager {
 
 	/** 阶段二：输出 freeform ops 并展开建造。designBrief 可空（调整/重做时靠 previousReply）。 */
 	private void launchOps(Minecraft client, String desc, String previousReply, String adjustment,
-			String repairHint, int attempt, String designBrief, AiClient.StreamListener listener) {
+			String repairHint, int attempt, String designBrief, AiClient.StreamListener listener,
+			String imageDataUrl) {
 		String pos = posText;
 		if (designBrief != null && !designBrief.isEmpty()) {
 			pos = posText + "\n【设计要点（必须遵守）】\n" + designBrief
 					+ "\n请按上述要点输出完整 freeform JSON（紧凑 ops：优先 box，总 ops≤25，能 mirror 就 mirror）。";
 		}
 		CompletableFuture<AiClient.AiReply> pending = AiClient.askPlan(desc, pos, MinecraftAIClient.CONFIG,
-				previousReply, adjustment, repairHint, listener);
+				previousReply, adjustment, repairHint, listener, imageDataUrl);
 		pending.thenAcceptAsync(reply -> {
 			try {
 				String think = reply.thinking;
@@ -293,7 +306,7 @@ public class BuildTaskManager {
 				if (hint != null) {
 					MinecraftAIMod.LOGGER.warn("[Minecraft AI] 结果不合格，自动重新生成一次：{}", hint);
 					current.messages.add(new ChatMsg(MsgRole.SYSTEM, "结果不合格，自动重做一次…"));
-					launchOps(client, desc, previousReply, adjustment, hint, attempt + 1, designBrief, listener);
+					launchOps(client, desc, previousReply, adjustment, hint, attempt + 1, designBrief, listener, imageDataUrl);
 					return;
 				}
 				BuildingSpec spec = SpecParser.parse(text);
@@ -319,7 +332,7 @@ public class BuildTaskManager {
 									+ "③ block 字段不是合法方块 id —— 只能写原版 id（如 oak_planks、stone_bricks），"
 									+ "不要写中文、不要自造名字，blockstate 属性要单独放在 props 里。"
 									+ "请修正后重新输出完整的 freeform JSON。",
-							attempt + 1, designBrief, listener);
+							attempt + 1, designBrief, listener, imageDataUrl);
 					return;
 				}
 				MinecraftAIMod.LOGGER.info(

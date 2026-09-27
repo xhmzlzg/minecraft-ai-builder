@@ -237,10 +237,41 @@ public class AiClient {
 			""";
 
 	/**
-	 * 阶段一：设计要点（短 JSON）。
+	 * 组装 user 消息：有图时用 OpenAI vision 多模态 content 数组。
+	 * @param imageDataUrl  data:image/jpeg;base64,...  ；无图传 null
 	 */
+	private static JsonObject buildUserMessage(String text, String imageDataUrl) {
+		JsonObject user = new JsonObject();
+		user.addProperty("role", "user");
+		if (imageDataUrl == null || imageDataUrl.isEmpty()) {
+			user.addProperty("content", text);
+			return user;
+		}
+		JsonArray content = new JsonArray();
+		JsonObject t = new JsonObject();
+		t.addProperty("type", "text");
+		t.addProperty("text", text);
+		content.add(t);
+		JsonObject img = new JsonObject();
+		img.addProperty("type", "image_url");
+		JsonObject url = new JsonObject();
+		url.addProperty("url", imageDataUrl);
+		img.add("image_url", url);
+		content.add(img);
+		user.add("content", content);
+		return user;
+	}
+
 	public static CompletableFuture<AiReply> askDesignBrief(String description, String posText, AiConfig cfg,
 			StreamListener listener) {
+		return askDesignBrief(description, posText, cfg, null, listener);
+	}
+
+	/**
+	 * 阶段一：设计要点（短 JSON）。可带参考图（现实建筑照片）。
+	 */
+	public static CompletableFuture<AiReply> askDesignBrief(String description, String posText, AiConfig cfg,
+			String imageDataUrl, StreamListener listener) {
 		return CompletableFuture.supplyAsync(() -> {
 			CANCELLED.set(false);
 			String endpoint = cfg.chatEndpoint();
@@ -254,13 +285,27 @@ public class AiClient {
 			JsonArray messages = new JsonArray();
 			JsonObject system = new JsonObject();
 			system.addProperty("role", "system");
-			system.addProperty("content", DESIGN_BRIEF_SYSTEM);
+			String sysPrompt = DESIGN_BRIEF_SYSTEM;
+			if (imageDataUrl != null && !imageDataUrl.isEmpty()) {
+				sysPrompt = DESIGN_BRIEF_SYSTEM + """
+
+						======= 参考图模式 =======
+						玩家提供了一张【现实建筑/物体照片】。请据此设计 Minecraft 版本：
+						1. 从图中识别：外形轮廓、层数、屋顶形式、门窗节奏、材质气质、标志特征。
+						2. 材质映射到 Minecraft：玻璃幕墙→glass/light_blue_stained_glass，白墙→white_concrete，
+						   红砖→brick，石→stone_bricks，木→oak/dark_oak_planks，金属→iron_block/gray_concrete…
+						3. 忠实保留**辨识特征**（尖顶/圆顶/斜面/塔楼/拱廊/雕塑姿态），但用方块表达，
+						   不必抄所有细部；忽略照片里的汽车、人、树、路灯等环境物。
+						4. outline / parts 要对照照片写；avoid 写「不要做成通用方盒子」。
+						5. 若看不清层数，按窗排估计并在 notes 写明假设。
+						""";
+			}
+			system.addProperty("content", sysPrompt);
 			messages.add(system);
-			JsonObject user = new JsonObject();
-			user.addProperty("role", "user");
-			user.addProperty("content", "在坐标 " + posText + " 建造：" + description
-					+ "\n请只输出设计要点 JSON。");
-			messages.add(user);
+			String text = "在坐标 " + posText + " 建造：" + description
+					+ (imageDataUrl != null ? "\n（已附参考图，请按图设计）" : "")
+					+ "\n请只输出设计要点 JSON。";
+			messages.add(buildUserMessage(text, imageDataUrl));
 			body.add("messages", messages);
 
 			final int maxAttempts = 3;
@@ -360,25 +405,32 @@ public class AiClient {
 	}
 
 	public static CompletableFuture<AiReply> askPlan(String description, String posText, AiConfig cfg) {
-		return askPlan(description, posText, cfg, null, null, null, null);
+		return askPlan(description, posText, cfg, null, null, null, null, null);
 	}
 
 	public static CompletableFuture<AiReply> askPlan(String description, String posText, AiConfig cfg,
 			String previousReply, String adjustment) {
-		return askPlan(description, posText, cfg, previousReply, adjustment, null, null);
+		return askPlan(description, posText, cfg, previousReply, adjustment, null, null, null);
 	}
 
 	public static CompletableFuture<AiReply> askPlan(String description, String posText, AiConfig cfg,
 			String previousReply, String adjustment, String repairHint) {
-		return askPlan(description, posText, cfg, previousReply, adjustment, repairHint, null);
+		return askPlan(description, posText, cfg, previousReply, adjustment, repairHint, null, null);
+	}
+
+	public static CompletableFuture<AiReply> askPlan(String description, String posText, AiConfig cfg,
+			String previousReply, String adjustment, String repairHint, StreamListener listener) {
+		return askPlan(description, posText, cfg, previousReply, adjustment, repairHint, listener, null);
 	}
 
 	/**
 	 * 带对话历史的流式请求。
 	 * @param listener 可选：实时推送思考/正文增量
+	 * @param imageDataUrl 可选：参考图 data URL
 	 */
 	public static CompletableFuture<AiReply> askPlan(String description, String posText, AiConfig cfg,
-			String previousReply, String adjustment, String repairHint, StreamListener listener) {
+			String previousReply, String adjustment, String repairHint, StreamListener listener,
+			String imageDataUrl) {
 		return CompletableFuture.supplyAsync(() -> {
 			CANCELLED.set(false);
 			String endpoint = cfg.chatEndpoint();
@@ -396,10 +448,9 @@ public class AiClient {
 			system.addProperty("content", SYSTEM_PROMPT_V2);
 			messages.add(system);
 
-			JsonObject user = new JsonObject();
-			user.addProperty("role", "user");
-			user.addProperty("content", "在坐标 " + posText + " 建造：" + description);
-			messages.add(user);
+			String userText = "在坐标 " + posText + " 建造：" + description
+					+ (imageDataUrl != null ? "\n（已附现实建筑参考图，外形与材质尽量贴近照片，用 Minecraft 方块表达）" : "");
+			messages.add(buildUserMessage(userText, imageDataUrl));
 
 			if (previousReply != null) {
 				JsonObject assistant = new JsonObject();
