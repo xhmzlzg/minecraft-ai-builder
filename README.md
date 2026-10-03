@@ -4,11 +4,23 @@
 3D 预览确认后一键建造，随时可撤销；不满意可以继续用一句话提意见迭代调整。
 生成过程在后台运行，关掉面板也不中断。
 
-> 适用版本：Minecraft **26.1.2** + Fabric Loader **≥0.19.0** + Fabric API **0.155.2+26.1.2** + Java **≥24**
+> 适用版本：Minecraft **26.3**（兼容 ≥26.1.2）+ Fabric Loader **≥0.19.0** + Fabric API **0.161.0+26.3** + Java **≥24**
 
 **核心立场：形状完全由你的提示词决定 —— 程序里没有任何建筑模板。** 船、飞机、雕像、桥、茶室、四合院、
 城堡、住宅楼、写字楼、商场……全部由 AI 用 ops 绘制指令现画；程序只负责把指令翻译成方块，
 外加"栏杆自动连片 / 灯笼自动吊挂 / 孤立方块体检"这类兜底，不做任何形状假设。
+
+---
+
+## v1.1.3 做了什么（相对 v1.1.2）
+
+| 改动 | 说明 |
+| --- | --- |
+| **兼容 Minecraft 26.3** | 面向 Fabric Loader 0.19.5 + Fabric API `0.161.0+26.3` 编译；`fabric.mod.json` 依赖改为 `minecraft >= 26.1.2` |
+| **26.3 API 适配** | `setScreenAndShow`、`gui.screen()`、`InputConstants`（去掉对 `org.lwjgl.glfw` 的编译依赖） |
+| **项目记忆文档** | 新增 `docs/PROJECT_MEMORY.md`，记录架构、路径、构建部署与待办 |
+
+> **安全**：API Key 只保存在本机 `config/minecraft-ai.json`，**不进仓库、不进 Release**。
 
 ---
 

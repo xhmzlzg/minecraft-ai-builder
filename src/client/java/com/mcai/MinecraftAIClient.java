@@ -11,7 +11,6 @@ import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
 import net.fabricmc.loader.api.FabricLoader;
 import net.minecraft.client.KeyMapping;
 import net.minecraft.resources.Identifier;
-import org.lwjgl.glfw.GLFW;
 
 public class MinecraftAIClient implements ClientModInitializer {
 	public static AiConfig CONFIG;
@@ -29,12 +28,13 @@ public class MinecraftAIClient implements ClientModInitializer {
 
 		openScreenKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
 				"key.minecraft-ai.open_screen",
-				GLFW.GLFW_KEY_K,
+				InputConstants.KEY_K,
 				KeyMapping.Category.MISC));
 
 		ClientTickEvents.END_CLIENT_TICK.register(client -> {
 			if (openScreenKey.consumeClick() && client.player != null) {
-				client.setScreen(new AiBuildScreen(CONFIG));
+				// 26.3：setScreenAndShow / gui.setScreen 取代 Minecraft.setScreen
+				client.setScreenAndShow(new AiBuildScreen(CONFIG));
 			}
 			// 游戏内鼠标被捕获无法点击 HUD，悬浮球仅作状态提示，按 K 查看结果
 		});

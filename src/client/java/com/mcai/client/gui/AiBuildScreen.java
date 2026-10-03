@@ -204,7 +204,7 @@ public class AiBuildScreen extends Screen {
 				.build();
 		settingsButton = Button.builder(Component.literal("设置"), b -> {
 					if (this.minecraft != null) {
-						this.minecraft.setScreen(new AiConfigScreen(config));
+						this.minecraft.setScreenAndShow(new AiConfigScreen(config));
 					}
 				})
 				.bounds(panelX + panelW - 80, toolY, 70, btnH)
@@ -338,22 +338,10 @@ public class AiBuildScreen extends Screen {
 	@Override
 	public boolean keyPressed(net.minecraft.client.input.KeyEvent event) {
 		try {
-			if (event != null && event.key() == org.lwjgl.glfw.GLFW.GLFW_KEY_V) {
-				boolean ctrl = event.hasControlDown();
-				if (!ctrl) {
-					// 兜底：直接读 GLFW 修饰键
-					try {
-						long win = org.lwjgl.glfw.GLFW.glfwGetCurrentContext();
-						ctrl = win != 0 && (org.lwjgl.glfw.GLFW.glfwGetKey(win, org.lwjgl.glfw.GLFW.GLFW_KEY_LEFT_CONTROL) != 0
-								|| org.lwjgl.glfw.GLFW.glfwGetKey(win, org.lwjgl.glfw.GLFW.GLFW_KEY_RIGHT_CONTROL) != 0);
-					} catch (Throwable ignored) {
-					}
-				}
-				if (ctrl) {
-					// 图片则附上；纯文字则交回默认粘贴
-					if (tryPasteClipboardImage()) {
-						return true;
-					}
+			// 26.3：不用 org.lwjgl.glfw，用 InputConstants.KEY_V
+			if (event != null && event.key() == com.mojang.blaze3d.platform.InputConstants.KEY_V) {
+				if (event.hasControlDown() && tryPasteClipboardImage()) {
+					return true;
 				}
 			}
 		} catch (Throwable ignored) {

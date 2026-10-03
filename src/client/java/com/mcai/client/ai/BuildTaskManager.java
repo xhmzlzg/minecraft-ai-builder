@@ -554,7 +554,7 @@ public class BuildTaskManager {
 
 	public static void renderBall(net.minecraft.client.gui.GuiGraphicsExtractor g) {
 		Minecraft client = Minecraft.getInstance();
-		if (client.screen != null || client.player == null) {
+		if ((client.gui == null || client.gui.screen() != null) || client.player == null) {
 			return;
 		}
 		Phase p = INSTANCE.phase;
